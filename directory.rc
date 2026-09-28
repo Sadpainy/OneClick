@@ -1,0 +1,515 @@
+# Persistence directory management and partition mount skeleton
+
+ZC_ROOT="/data/local/zc"
+ZC_SYSTEM="/system/etc/zc"
+ZC_PERSIST="/persist/zc"
+ZC_VENDOR="/vendor/etc/zc"
+ZC_PRODUCT="/product/etc/zc"
+ZC_DATA="/data/zc"
+ZC_TMP="/data/local/tmp/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_DIR_DB="$ZC_ROOT/dir_state.db"
+ZC_DIR_LOG="$ZC_ROOT/dir.log"
+ZC_VERSION="1.0"
+ZC_MOUNT_RETRY=3
+ZC_MOUNT_WAIT=1
+
+zc_dir_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+  echo "[$ts] $msg" >> "$ZC_DIR_LOG" 2>/dev/null
+}
+
+zc_dir_init_db() {
+  if [ ! -f "$ZC_DIR_DB" ]; then
+    echo "CREATE TABLE dirs (path TEXT PRIMARY KEY, purpose TEXT, ts TEXT);" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+    echo "CREATE TABLE mounts (part TEXT PRIMARY KEY, mode TEXT, ts TEXT);" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+    echo "CREATE TABLE files (path TEXT PRIMARY KEY, src TEXT, ts TEXT);" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+    echo "CREATE TABLE dir_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+    zc_dir_log "dir db initialized"
+  fi
+}
+
+zc_dir_state_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO dir_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+}
+
+zc_dir_state_get() {
+  local key="$1"
+  sqlite3 "$ZC_DIR_DB" "SELECT value FROM dir_state WHERE key='$key';" 2>/dev/null
+}
+
+zc_dir_register() {
+  local path="$1"
+  local purpose="$2"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO dirs (path, purpose, ts) VALUES ('$path', '$purpose', '$ts');" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+}
+
+zc_dir_register_mount() {
+  local part="$1"
+  local mode="$2"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO mounts (part, mode, ts) VALUES ('$part', '$mode', '$ts');" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+}
+
+zc_dir_register_file() {
+  local path="$1"
+  local src="$2"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO files (path, src, ts) VALUES ('$path', '$src', '$ts');" | sqlite3 "$ZC_DIR_DB" 2>/dev/null
+}
+
+zc_dir_check_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    zc_dir_log "not root, abort"
+    return 1
+  fi
+  return 0
+}
+
+zc_dir_check_selinux() {
+  local mode
+  mode=$(getenforce 2>/dev/null)
+  if [ "$mode" = "Enforcing" ]; then
+    setenforce 0 2>/dev/null
+    zc_dir_log "selinux permissive"
+  fi
+  return 0
+}
+
+zc_dir_mount_rw() {
+  local part="$1"
+  local attempt=0
+  while [ "$attempt" -lt "$ZC_MOUNT_RETRY" ]; do
+    mount -o remount,rw "$part" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      zc_dir_register_mount "$part" "rw"
+      zc_dir_log "mounted rw: $part"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep "$ZC_MOUNT_WAIT"
+  done
+  zc_dir_log "mount rw failed: $part"
+  return 1
+}
+
+zc_dir_mount_ro() {
+  local part="$1"
+  mount -o remount,ro "$part" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    zc_dir_register_mount "$part" "ro"
+    zc_dir_log "mounted ro: $part"
+    return 0
+  fi
+  zc_dir_log "mount ro failed: $part"
+  return 1
+}
+
+zc_dir_is_mounted() {
+  local part="$1"
+  if mount 2>/dev/null | grep -q " $part "; then
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_get_mount_mode() {
+  local part="$1"
+  mount 2>/dev/null | grep " $part " | awk '{print $6}' | head -n 1
+}
+
+zc_dir_list_partitions() {
+  mount 2>/dev/null | awk '{print $3}' | sort -u
+}
+
+zc_dir_check_partition() {
+  local part="$1"
+  if [ -d "$part" ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_create() {
+  local path="$1"
+  local purpose="$2"
+  if [ ! -d "$path" ]; then
+    mkdir -p "$path" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      zc_dir_register "$path" "$purpose"
+      zc_dir_log "created: $path"
+      return 0
+    fi
+    zc_dir_log "create failed: $path"
+    return 1
+  fi
+  zc_dir_register "$path" "$purpose"
+  return 0
+}
+
+zc_dir_set_perms() {
+  local path="$1"
+  local mode="$2"
+  if [ -d "$path" ]; then
+    chmod "$mode" "$path" 2>/dev/null
+    zc_dir_log "perms set: $path $mode"
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_set_owner() {
+  local path="$1"
+  local owner="$2"
+  if [ -d "$path" ]; then
+    chown "$owner" "$path" 2>/dev/null
+    zc_dir_log "owner set: $path $owner"
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_create_all() {
+  zc_dir_create "$ZC_ROOT" "runtime"
+  zc_dir_create "$ZC_TMP" "temp"
+  zc_dir_create "$ZC_DATA" "data"
+  zc_dir_create "$ZC_SYSTEM" "system-persist"
+  zc_dir_create "$ZC_PERSIST" "persist-persist"
+  zc_dir_create "$ZC_VENDOR" "vendor-persist"
+  zc_dir_create "$ZC_PRODUCT" "product-persist"
+  zc_dir_set_perms "$ZC_ROOT" "700"
+  zc_dir_set_perms "$ZC_TMP" "700"
+  zc_dir_set_perms "$ZC_DATA" "700"
+  zc_dir_set_perms "$ZC_SYSTEM" "700"
+  zc_dir_set_perms "$ZC_PERSIST" "700"
+  zc_dir_set_perms "$ZC_VENDOR" "700"
+  zc_dir_set_perms "$ZC_PRODUCT" "700"
+  zc_dir_log "all dirs created"
+}
+
+zc_dir_prepare_system() {
+  if ! zc_dir_check_partition /system; then
+    zc_dir_log "system partition missing"
+    return 1
+  fi
+  zc_dir_mount_rw /system
+  zc_dir_create "$ZC_SYSTEM" "system-persist"
+  zc_dir_set_perms "$ZC_SYSTEM" "700"
+  zc_dir_mount_ro /system
+  zc_dir_log "system prepared"
+}
+
+zc_dir_prepare_persist() {
+  if ! zc_dir_check_partition /persist; then
+    zc_dir_log "persist partition missing"
+    return 1
+  fi
+  zc_dir_mount_rw /persist
+  zc_dir_create "$ZC_PERSIST" "persist-persist"
+  zc_dir_set_perms "$ZC_PERSIST" "700"
+  zc_dir_mount_ro /persist
+  zc_dir_log "persist prepared"
+}
+
+zc_dir_prepare_vendor() {
+  if ! zc_dir_check_partition /vendor; then
+    zc_dir_log "vendor partition missing"
+    return 1
+  fi
+  zc_dir_mount_rw /vendor
+  zc_dir_create "$ZC_VENDOR" "vendor-persist"
+  zc_dir_set_perms "$ZC_VENDOR" "700"
+  zc_dir_mount_ro /vendor
+  zc_dir_log "vendor prepared"
+}
+
+zc_dir_prepare_product() {
+  if ! zc_dir_check_partition /product; then
+    zc_dir_log "product partition missing"
+    return 1
+  fi
+  zc_dir_mount_rw /product
+  zc_dir_create "$ZC_PRODUCT" "product-persist"
+  zc_dir_set_perms "$ZC_PRODUCT" "700"
+  zc_dir_mount_ro /product
+  zc_dir_log "product prepared"
+}
+
+zc_dir_prepare_all() {
+  zc_dir_prepare_system
+  zc_dir_prepare_persist
+  zc_dir_prepare_vendor
+  zc_dir_prepare_product
+  zc_dir_log "all partitions prepared"
+}
+
+zc_dir_copy_file() {
+  local src="$1"
+  local dst="$2"
+  if [ ! -f "$src" ]; then
+    zc_dir_log "copy src missing: $src"
+    return 1
+  fi
+  cp "$src" "$dst" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    zc_dir_register_file "$dst" "$src"
+    zc_dir_log "copied: $src -> $dst"
+    return 0
+  fi
+  zc_dir_log "copy failed: $src -> $dst"
+  return 1
+}
+
+zc_dir_copy_to_system() {
+  local src="$1"
+  local name
+  name=$(basename "$src")
+  local dst="$ZC_SYSTEM/$name"
+  zc_dir_mount_rw /system
+  zc_dir_copy_file "$src" "$dst"
+  zc_dir_mount_ro /system
+}
+
+zc_dir_copy_to_persist() {
+  local src="$1"
+  local name
+  name=$(basename "$src")
+  local dst="$ZC_PERSIST/$name"
+  zc_dir_mount_rw /persist
+  zc_dir_copy_file "$src" "$dst"
+  zc_dir_mount_ro /persist
+}
+
+zc_dir_copy_to_vendor() {
+  local src="$1"
+  local name
+  name=$(basename "$src")
+  local dst="$ZC_VENDOR/$name"
+  zc_dir_mount_rw /vendor
+  zc_dir_copy_file "$src" "$dst"
+  zc_dir_mount_ro /vendor
+}
+
+zc_dir_copy_to_product() {
+  local src="$1"
+  local name
+  name=$(basename "$src")
+  local dst="$ZC_PRODUCT/$name"
+  zc_dir_mount_rw /product
+  zc_dir_copy_file "$src" "$dst"
+  zc_dir_mount_ro /product
+}
+
+zc_dir_copy_all() {
+  local src_dir="$1"
+  local f
+  for f in "$src_dir"/*; do
+    if [ -f "$f" ]; then
+      zc_dir_copy_to_system "$f"
+      zc_dir_copy_to_persist "$f"
+    fi
+  done
+  zc_dir_log "all files copied"
+}
+
+zc_dir_verify_file() {
+  local path="$1"
+  local expected="$2"
+  if [ ! -f "$path" ]; then
+    return 1
+  fi
+  local actual
+  actual=$(openssl dgst -sha256 "$path" 2>/dev/null | awk '{print $NF}')
+  if [ "$actual" = "$expected" ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_verify_all() {
+  local path
+  local count=0
+  local ok=0
+  while IFS= read -r path; do
+    count=$((count + 1))
+    if [ -f "$path" ]; then
+      ok=$((ok + 1))
+    fi
+  done <<EOF
+$(sqlite3 "$ZC_DIR_DB" "SELECT path FROM files;" 2>/dev/null)
+EOF
+  zc_dir_log "verify: $ok/$count"
+}
+
+zc_dir_remove_file() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    rm -f "$path" 2>/dev/null
+    zc_dir_log "removed: $path"
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_remove_dir() {
+  local path="$1"
+  if [ -d "$path" ]; then
+    rm -rf "$path" 2>/dev/null
+    zc_dir_log "removed dir: $path"
+    return 0
+  fi
+  return 1
+}
+
+zc_dir_clean_all() {
+  zc_dir_remove_dir "$ZC_TMP"
+  zc_dir_log "all cleaned"
+}
+
+zc_dir_list_registered() {
+  sqlite3 "$ZC_DIR_DB" "SELECT path, purpose FROM dirs;" 2>/dev/null
+}
+
+zc_dir_list_files() {
+  sqlite3 "$ZC_DIR_DB" "SELECT path, src FROM files;" 2>/dev/null
+}
+
+zc_dir_list_mounts() {
+  sqlite3 "$ZC_DIR_DB" "SELECT part, mode FROM mounts;" 2>/dev/null
+}
+
+zc_dir_check_integrity() {
+  local path
+  local missing=0
+  while IFS= read -r path; do
+    if [ ! -e "$path" ]; then
+      missing=$((missing + 1))
+      zc_dir_log "missing: $path"
+    fi
+  done <<EOF
+$(sqlite3 "$ZC_DIR_DB" "SELECT path FROM dirs;" 2>/dev/null)
+EOF
+  zc_dir_log "integrity missing: $missing"
+  echo "$missing"
+}
+
+zc_dir_repair() {
+  zc_dir_create_all
+  zc_dir_prepare_all
+  zc_dir_log "repair done"
+}
+
+zc_dir_install_init_hook() {
+  local init_rc="/system/etc/init/hw/init.rc"
+  if [ ! -f "$init_rc" ]; then
+    init_rc="/init.rc"
+  fi
+  if [ ! -f "$init_rc" ]; then
+    zc_dir_log "init.rc not found"
+    return 1
+  fi
+  zc_dir_mount_rw /system
+  if ! grep -q "zc/directory.rc" "$init_rc" 2>/dev/null; then
+    echo "" >> "$init_rc"
+    echo "import /system/etc/zc/directory.rc" >> "$init_rc"
+    zc_dir_log "init hook installed"
+  fi
+  zc_dir_mount_ro /system
+}
+
+zc_dir_remove_init_hook() {
+  local init_rc="/system/etc/init/hw/init.rc"
+  if [ ! -f "$init_rc" ]; then
+    init_rc="/init.rc"
+  fi
+  if [ ! -f "$init_rc" ]; then
+    return 1
+  fi
+  zc_dir_mount_rw /system
+  grep -v "zc/directory.rc" "$init_rc" > "$ZC_TMP/init.tmp" 2>/dev/null
+  if [ -f "$ZC_TMP/init.tmp" ]; then
+    cat "$ZC_TMP/init.tmp" > "$init_rc" 2>/dev/null
+    rm -f "$ZC_TMP/init.tmp"
+    zc_dir_log "init hook removed"
+  fi
+  zc_dir_mount_ro /system
+}
+
+zc_dir_status() {
+  echo "ZC dir version: $ZC_VERSION"
+  echo "root: $(id -u)"
+  echo "selinux: $(getenforce 2>/dev/null)"
+  echo "system mounted: $(zc_dir_get_mount_mode /system)"
+  echo "persist mounted: $(zc_dir_get_mount_mode /persist)"
+  echo "registered dirs: $(sqlite3 "$ZC_DIR_DB" "SELECT COUNT(*) FROM dirs;" 2>/dev/null)"
+  echo "registered files: $(sqlite3 "$ZC_DIR_DB" "SELECT COUNT(*) FROM files;" 2>/dev/null)"
+  echo "dir db: $ZC_DIR_DB"
+  echo "dir log: $ZC_DIR_LOG"
+}
+
+zc_dir_main() {
+  zc_dir_log "directory.rc start"
+  zc_dir_check_root || exit 1
+  zc_dir_check_selinux
+  zc_dir_init_db
+  zc_dir_state_set "version" "$ZC_VERSION"
+  zc_dir_create_all
+  zc_dir_prepare_all
+  zc_dir_install_init_hook
+  zc_dir_verify_all
+  zc_dir_status
+  zc_dir_log "directory.rc done"
+}
+
+case "$1" in
+  start)
+    zc_dir_main
+    ;;
+  create)
+    zc_dir_create_all
+    ;;
+  prepare)
+    zc_dir_prepare_all
+    ;;
+  copy)
+    zc_dir_copy_all "$2"
+    ;;
+  verify)
+    zc_dir_verify_all
+    ;;
+  integrity)
+    zc_dir_check_integrity
+    ;;
+  repair)
+    zc_dir_repair
+    ;;
+  clean)
+    zc_dir_clean_all
+    ;;
+  list)
+    zc_dir_list_registered
+    zc_dir_list_files
+    zc_dir_list_mounts
+    ;;
+  remove-hook)
+    zc_dir_remove_init_hook
+    ;;
+  status)
+    zc_dir_status
+    ;;
+  *)
+    zc_dir_main
+    ;;
+esac
+
+exit 0
