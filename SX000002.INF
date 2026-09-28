@@ -1,0 +1,439 @@
+# SX000002.INF - c2 communication log encrypted storage skeleton
+
+ZC_ROOT="/data/local/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_SX_DB="$ZC_ROOT/SX000002.INF"
+ZC_SX_META="$ZC_ROOT/SX000002.meta"
+ZC_SX_KEY="$ZC_ROOT/.sxkey"
+ZC_SX_LOG="$ZC_ROOT/sx.log"
+ZC_VERSION="1.0"
+ZC_SX_MAX=10000
+ZC_SX_RETENTION=14
+ZC_SX_CIPHER="aes-256-cbc"
+ZC_SX_HASH="sha256"
+ZC_SX_KEY_LEN=32
+ZC_SX_IV_LEN=16
+ZC_SX_DIRECTIONS="in out sync"
+
+zc_sx_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+  echo "[$ts] $msg" >> "$ZC_SX_LOG" 2>/dev/null
+}
+
+zc_sx_init_dirs() {
+  mkdir -p "$ZC_ROOT" 2>/dev/null
+  chmod 700 "$ZC_ROOT" 2>/dev/null
+  zc_sx_log "sx dirs initialized"
+}
+
+zc_sx_gen_key() {
+  if [ -f "$ZC_SX_KEY" ]; then
+    cat "$ZC_SX_KEY"
+    return 0
+  fi
+  local key
+  if [ -r /dev/urandom ]; then
+    key=$(head -c "$ZC_SX_KEY_LEN" /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    key=$(date +%s%N | sha256sum | awk '{print $1}')
+  fi
+  echo "$key" > "$ZC_SX_KEY" 2>/dev/null
+  chmod 600 "$ZC_SX_KEY" 2>/dev/null
+  zc_sx_log "sx key generated"
+  echo "$key"
+}
+
+zc_sx_gen_iv() {
+  local iv
+  if [ -r /dev/urandom ]; then
+    iv=$(head -c "$ZC_SX_IV_LEN" /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    iv=$(date +%s%N | sha256sum | cut -c1-32)
+  fi
+  echo "$iv"
+}
+
+zc_sx_hash() {
+  local input="$1"
+  echo -n "$input" | openssl dgst -"$ZC_SX_HASH" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_sx_encrypt() {
+  local data="$1"
+  local key="$2"
+  local iv="$3"
+  echo "$data" | openssl enc -e -"$ZC_SX_CIPHER" -a -K "$key" -iv "$iv" 2>/dev/null
+}
+
+zc_sx_decrypt() {
+  local data="$1"
+  local key="$2"
+  local iv="$3"
+  echo "$data" | openssl enc -d -"$ZC_SX_CIPHER" -a -K "$key" -iv "$iv" 2>/dev/null
+}
+
+zc_sx_init_db() {
+  if [ ! -f "$ZC_SX_DB" ]; then
+    echo "CREATE TABLE c2_logs (id TEXT PRIMARY KEY, data TEXT, iv TEXT, hash TEXT, direction TEXT, ts TEXT);" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+    echo "CREATE TABLE sx_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+    echo "CREATE TABLE sx_index (id TEXT PRIMARY KEY, direction TEXT, endpoint TEXT, ts TEXT);" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+    zc_sx_log "sx db initialized"
+  fi
+}
+
+zc_sx_state_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO sx_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+}
+
+zc_sx_state_get() {
+  local key="$1"
+  sqlite3 "$ZC_SX_DB" "SELECT value FROM sx_state WHERE key='$key';" 2>/dev/null
+}
+
+zc_sx_store() {
+  local id="$1"
+  local data="$2"
+  local iv="$3"
+  local hash="$4"
+  local direction="$5"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO c2_logs (id, data, iv, hash, direction, ts) VALUES ('$id', '$data', '$iv', '$hash', '$direction', '$ts');" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+}
+
+zc_sx_index_add() {
+  local id="$1"
+  local direction="$2"
+  local endpoint="$3"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO sx_index (id, direction, endpoint, ts) VALUES ('$id', '$direction', '$endpoint', '$ts');" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+}
+
+zc_sx_gen_id() {
+  local id
+  if [ -r /dev/urandom ]; then
+    id=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    id=$(date +%s%N | sha256sum | cut -c1-16)
+  fi
+  echo "$id"
+}
+
+zc_sx_valid_direction() {
+  local d="$1"
+  local valid
+  for valid in $ZC_SX_DIRECTIONS; do
+    if [ "$d" = "$valid" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+zc_sx_write() {
+  local direction="$1"
+  local endpoint="$2"
+  local message="$3"
+  if ! zc_sx_valid_direction "$direction"; then
+    zc_sx_log "invalid direction: $direction"
+    return 1
+  fi
+  local key
+  key=$(zc_sx_gen_key)
+  local iv
+  iv=$(zc_sx_gen_iv)
+  local enc
+  enc=$(zc_sx_encrypt "$message" "$key" "$iv")
+  if [ -z "$enc" ]; then
+    zc_sx_log "encrypt failed"
+    return 1
+  fi
+  local id
+  id=$(zc_sx_gen_id)
+  local hash
+  hash=$(zc_sx_hash "$message")
+  zc_sx_store "$id" "$enc" "$iv" "$hash" "$direction"
+  zc_sx_index_add "$id" "$direction" "$endpoint"
+  zc_sx_log "written: $id $direction $endpoint"
+  echo "$id"
+}
+
+zc_sx_read() {
+  local id="$1"
+  local data
+  local iv
+  local key
+  data=$(sqlite3 "$ZC_SX_DB" "SELECT data FROM c2_logs WHERE id='$id';" 2>/dev/null)
+  iv=$(sqlite3 "$ZC_SX_DB" "SELECT iv FROM c2_logs WHERE id='$id';" 2>/dev/null)
+  if [ -z "$data" ] || [ -z "$iv" ]; then
+    zc_sx_log "read missing: $id"
+    return 1
+  fi
+  key=$(zc_sx_gen_key)
+  zc_sx_decrypt "$data" "$key" "$iv"
+}
+
+zc_sx_verify() {
+  local id="$1"
+  local data
+  local iv
+  local expected
+  data=$(sqlite3 "$ZC_SX_DB" "SELECT data FROM c2_logs WHERE id='$id';" 2>/dev/null)
+  iv=$(sqlite3 "$ZC_SX_DB" "SELECT iv FROM c2_logs WHERE id='$id';" 2>/dev/null)
+  expected=$(sqlite3 "$ZC_SX_DB" "SELECT hash FROM c2_logs WHERE id='$id';" 2>/dev/null)
+  if [ -z "$data" ] || [ -z "$iv" ] || [ -z "$expected" ]; then
+    return 1
+  fi
+  local key
+  key=$(zc_sx_gen_key)
+  local plain
+  plain=$(zc_sx_decrypt "$data" "$key" "$iv")
+  local actual
+  actual=$(zc_sx_hash "$plain")
+  if [ "$actual" = "$expected" ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_sx_list() {
+  sqlite3 "$ZC_SX_DB" "SELECT id, direction, endpoint, ts FROM sx_index ORDER BY ts DESC;" 2>/dev/null
+}
+
+zc_sx_list_direction() {
+  local direction="$1"
+  sqlite3 "$ZC_SX_DB" "SELECT id, endpoint, ts FROM sx_index WHERE direction='$direction' ORDER BY ts DESC;" 2>/dev/null
+}
+
+zc_sx_list_endpoint() {
+  local endpoint="$1"
+  sqlite3 "$ZC_SX_DB" "SELECT id, direction, ts FROM sx_index WHERE endpoint='$endpoint' ORDER BY ts DESC;" 2>/dev/null
+}
+
+zc_sx_count() {
+  sqlite3 "$ZC_SX_DB" "SELECT COUNT(*) FROM c2_logs;" 2>/dev/null
+}
+
+zc_sx_count_direction() {
+  local direction="$1"
+  sqlite3 "$ZC_SX_DB" "SELECT COUNT(*) FROM sx_index WHERE direction='$direction';" 2>/dev/null
+}
+
+zc_sx_count_endpoint() {
+  local endpoint="$1"
+  sqlite3 "$ZC_SX_DB" "SELECT COUNT(*) FROM sx_index WHERE endpoint='$endpoint';" 2>/dev/null
+}
+
+zc_sx_delete() {
+  local id="$1"
+  echo "DELETE FROM c2_logs WHERE id='$id';" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+  echo "DELETE FROM sx_index WHERE id='$id';" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+  zc_sx_log "deleted: $id"
+}
+
+zc_sx_cleanup_old() {
+  local cutoff
+  cutoff=$(date -d "$ZC_SX_RETENTION days ago" +"%Y-%m-%d %H:%M:%S" 2>/dev/null)
+  if [ -z "$cutoff" ]; then
+    return 0
+  fi
+  echo "DELETE FROM c2_logs WHERE ts < '$cutoff';" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+  echo "DELETE FROM sx_index WHERE ts < '$cutoff';" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+  zc_sx_log "old logs cleaned"
+}
+
+zc_sx_cleanup_excess() {
+  local count
+  count=$(zc_sx_count)
+  if [ -z "$count" ]; then
+    return 0
+  fi
+  if [ "$count" -gt "$ZC_SX_MAX" ]; then
+    local excess
+    excess=$((count - ZC_SX_MAX))
+    local ids
+    ids=$(sqlite3 "$ZC_SX_DB" "SELECT id FROM c2_logs ORDER BY ts ASC LIMIT $excess;" 2>/dev/null)
+    local id
+    for id in $ids; do
+      zc_sx_delete "$id"
+    done
+    zc_sx_log "excess cleaned: $excess"
+  fi
+}
+
+zc_sx_rotate_key() {
+  local old
+  old=$(zc_sx_gen_key)
+  local new
+  if [ -r /dev/urandom ]; then
+    new=$(head -c "$ZC_SX_KEY_LEN" /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    new=$(date +%s%N | sha256sum | awk '{print $1}')
+  fi
+  echo "$new" > "$ZC_SX_KEY" 2>/dev/null
+  chmod 600 "$ZC_SX_KEY" 2>/dev/null
+  zc_sx_state_set "previous_key" "$old"
+  zc_sx_log "key rotated"
+  echo "$new"
+}
+
+zc_sx_export() {
+  local out="$1"
+  if [ -z "$out" ]; then
+    out="$ZC_ROOT/sx_export.txt"
+  fi
+  sqlite3 "$ZC_SX_DB" "SELECT id, data, iv, hash, direction, ts FROM c2_logs ORDER BY ts;" 2>/dev/null > "$out"
+  zc_sx_log "exported: $out"
+}
+
+zc_sx_import() {
+  local in="$1"
+  if [ ! -f "$in" ]; then
+    return 1
+  fi
+  local line
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+    local id
+    local data
+    local iv
+    local hash
+    local direction
+    local ts
+    id=$(echo "$line" | cut -d'|' -f1)
+    data=$(echo "$line" | cut -d'|' -f2)
+    iv=$(echo "$line" | cut -d'|' -f3)
+    hash=$(echo "$line" | cut -d'|' -f4)
+    direction=$(echo "$line" | cut -d'|' -f5)
+    ts=$(echo "$line" | cut -d'|' -f6)
+    if [ -n "$id" ] && [ -n "$data" ]; then
+      echo "INSERT OR REPLACE INTO c2_logs (id, data, iv, hash, direction, ts) VALUES ('$id', '$data', '$iv', '$hash', '$direction', '$ts');" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+    fi
+  done < "$in"
+  zc_sx_log "imported: $in"
+}
+
+zc_sx_wipe() {
+  echo "DELETE FROM c2_logs;" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+  echo "DELETE FROM sx_index;" | sqlite3 "$ZC_SX_DB" 2>/dev/null
+  rm -f "$ZC_SX_KEY" 2>/dev/null
+  zc_sx_log "wiped"
+}
+
+zc_sx_self_test() {
+  local test="zc_sx_selftest"
+  local id
+  id=$(zc_sx_write "out" "selftest" "$test")
+  if [ -z "$id" ]; then
+    zc_sx_log "self test write failed"
+    return 1
+  fi
+  local out
+  out=$(zc_sx_read "$id")
+  if [ "$out" != "$test" ]; then
+    zc_sx_log "self test read mismatch"
+    return 1
+  fi
+  if ! zc_sx_verify "$id"; then
+    zc_sx_log "self test verify failed"
+    return 1
+  fi
+  zc_sx_delete "$id"
+  zc_sx_log "self test passed"
+  return 0
+}
+
+zc_sx_status() {
+  echo "ZC sx version: $ZC_VERSION"
+  echo "cipher: $ZC_SX_CIPHER"
+  echo "hash: $ZC_SX_HASH"
+  echo "retention: $ZC_SX_RETENTION days"
+  echo "max: $ZC_SX_MAX"
+  echo "logs: $(zc_sx_count)"
+  echo "in: $(zc_sx_count_direction in)"
+  echo "out: $(zc_sx_count_direction out)"
+  echo "sx db: $ZC_SX_DB"
+  echo "sx log: $ZC_SX_LOG"
+}
+
+zc_sx_main() {
+  zc_sx_log "SX000002.INF start"
+  zc_sx_init_dirs
+  zc_sx_gen_key
+  zc_sx_init_db
+  zc_sx_state_set "version" "$ZC_VERSION"
+  zc_sx_self_test
+  zc_sx_cleanup_old
+  zc_sx_cleanup_excess
+  zc_sx_status
+  zc_sx_log "SX000002.INF done"
+}
+
+case "$1" in
+  start)
+    zc_sx_main
+    ;;
+  write)
+    zc_sx_write "$2" "$3" "$4"
+    ;;
+  read)
+    zc_sx_read "$2"
+    ;;
+  verify)
+    zc_sx_verify "$2"
+    ;;
+  list)
+    zc_sx_list
+    ;;
+  list-dir)
+    zc_sx_list_direction "$2"
+    ;;
+  list-end)
+    zc_sx_list_endpoint "$2"
+    ;;
+  count)
+    zc_sx_count
+    ;;
+  count-dir)
+    zc_sx_count_direction "$2"
+    ;;
+  delete)
+    zc_sx_delete "$2"
+    ;;
+  clean)
+    zc_sx_cleanup_old
+    zc_sx_cleanup_excess
+    ;;
+  rotate)
+    zc_sx_rotate_key
+    ;;
+  export)
+    zc_sx_export "$2"
+    ;;
+  import)
+    zc_sx_import "$2"
+    ;;
+  wipe)
+    zc_sx_wipe
+    ;;
+  selftest)
+    zc_sx_self_test
+    ;;
+  status)
+    zc_sx_status
+    ;;
+  *)
+    zc_sx_main
+    ;;
+esac
+
+exit 0
