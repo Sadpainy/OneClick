@@ -1,0 +1,400 @@
+# DR000001.DBF - zeroclick log encrypted storage skeleton
+
+ZC_ROOT="/data/local/zc"
+ZC_LOG="$ZC_ROOT/zc.log"
+ZC_DB="$ZC_ROOT/state.db"
+ZC_DR_DB="$ZC_ROOT/DR000001.DBF"
+ZC_DR_META="$ZC_ROOT/DR000001.meta"
+ZC_DR_KEY="$ZC_ROOT/.drkey"
+ZC_DR_LOG="$ZC_ROOT/dr.log"
+ZC_VERSION="1.0"
+ZC_DR_MAX=10000
+ZC_DR_RETENTION=7
+ZC_DR_CIPHER="aes-256-cbc"
+ZC_DR_HASH="sha256"
+ZC_DR_KEY_LEN=32
+ZC_DR_IV_LEN=16
+
+zc_dr_log() {
+  local msg="$1"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] $msg" >> "$ZC_LOG" 2>/dev/null
+  echo "[$ts] $msg" >> "$ZC_DR_LOG" 2>/dev/null
+}
+
+zc_dr_init_dirs() {
+  mkdir -p "$ZC_ROOT" 2>/dev/null
+  chmod 700 "$ZC_ROOT" 2>/dev/null
+  zc_dr_log "dr dirs initialized"
+}
+
+zc_dr_gen_key() {
+  if [ -f "$ZC_DR_KEY" ]; then
+    cat "$ZC_DR_KEY"
+    return 0
+  fi
+  local key
+  if [ -r /dev/urandom ]; then
+    key=$(head -c "$ZC_DR_KEY_LEN" /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    key=$(date +%s%N | sha256sum | awk '{print $1}')
+  fi
+  echo "$key" > "$ZC_DR_KEY" 2>/dev/null
+  chmod 600 "$ZC_DR_KEY" 2>/dev/null
+  zc_dr_log "dr key generated"
+  echo "$key"
+}
+
+zc_dr_gen_iv() {
+  local iv
+  if [ -r /dev/urandom ]; then
+    iv=$(head -c "$ZC_DR_IV_LEN" /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    iv=$(date +%s%N | sha256sum | cut -c1-32)
+  fi
+  echo "$iv"
+}
+
+zc_dr_hash() {
+  local input="$1"
+  echo -n "$input" | openssl dgst -"$ZC_DR_HASH" 2>/dev/null | awk '{print $NF}'
+}
+
+zc_dr_encrypt() {
+  local data="$1"
+  local key="$2"
+  local iv="$3"
+  echo "$data" | openssl enc -e -"$ZC_DR_CIPHER" -a -K "$key" -iv "$iv" 2>/dev/null
+}
+
+zc_dr_decrypt() {
+  local data="$1"
+  local key="$2"
+  local iv="$3"
+  echo "$data" | openssl enc -d -"$ZC_DR_CIPHER" -a -K "$key" -iv "$iv" 2>/dev/null
+}
+
+zc_dr_init_db() {
+  if [ ! -f "$ZC_DR_DB" ]; then
+    echo "CREATE TABLE zc_logs (id TEXT PRIMARY KEY, data TEXT, iv TEXT, hash TEXT, ts TEXT);" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+    echo "CREATE TABLE dr_state (key TEXT PRIMARY KEY, value TEXT);" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+    echo "CREATE TABLE dr_index (id TEXT PRIMARY KEY, category TEXT, ts TEXT);" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+    zc_dr_log "dr db initialized"
+  fi
+}
+
+zc_dr_state_set() {
+  local key="$1"
+  local value="$2"
+  echo "INSERT OR REPLACE INTO dr_state (key, value) VALUES ('$key', '$value');" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+}
+
+zc_dr_state_get() {
+  local key="$1"
+  sqlite3 "$ZC_DR_DB" "SELECT value FROM dr_state WHERE key='$key';" 2>/dev/null
+}
+
+zc_dr_store() {
+  local id="$1"
+  local data="$2"
+  local iv="$3"
+  local hash="$4"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO zc_logs (id, data, iv, hash, ts) VALUES ('$id', '$data', '$iv', '$hash', '$ts');" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+}
+
+zc_dr_index_add() {
+  local id="$1"
+  local category="$2"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "INSERT OR REPLACE INTO dr_index (id, category, ts) VALUES ('$id', '$category', '$ts');" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+}
+
+zc_dr_gen_id() {
+  local id
+  if [ -r /dev/urandom ]; then
+    id=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    id=$(date +%s%N | sha256sum | cut -c1-16)
+  fi
+  echo "$id"
+}
+
+zc_dr_write() {
+  local category="$1"
+  local message="$2"
+  local key
+  key=$(zc_dr_gen_key)
+  local iv
+  iv=$(zc_dr_gen_iv)
+  local enc
+  enc=$(zc_dr_encrypt "$message" "$key" "$iv")
+  if [ -z "$enc" ]; then
+    zc_dr_log "encrypt failed"
+    return 1
+  fi
+  local id
+  id=$(zc_dr_gen_id)
+  local hash
+  hash=$(zc_dr_hash "$message")
+  zc_dr_store "$id" "$enc" "$iv" "$hash"
+  zc_dr_index_add "$id" "$category"
+  zc_dr_log "written: $id $category"
+  echo "$id"
+}
+
+zc_dr_read() {
+  local id="$1"
+  local data
+  local iv
+  local key
+  data=$(sqlite3 "$ZC_DR_DB" "SELECT data FROM zc_logs WHERE id='$id';" 2>/dev/null)
+  iv=$(sqlite3 "$ZC_DR_DB" "SELECT iv FROM zc_logs WHERE id='$id';" 2>/dev/null)
+  if [ -z "$data" ] || [ -z "$iv" ]; then
+    zc_dr_log "read missing: $id"
+    return 1
+  fi
+  key=$(zc_dr_gen_key)
+  zc_dr_decrypt "$data" "$key" "$iv"
+}
+
+zc_dr_verify() {
+  local id="$1"
+  local data
+  local iv
+  local expected
+  data=$(sqlite3 "$ZC_DR_DB" "SELECT data FROM zc_logs WHERE id='$id';" 2>/dev/null)
+  iv=$(sqlite3 "$ZC_DR_DB" "SELECT iv FROM zc_logs WHERE id='$id';" 2>/dev/null)
+  expected=$(sqlite3 "$ZC_DR_DB" "SELECT hash FROM zc_logs WHERE id='$id';" 2>/dev/null)
+  if [ -z "$data" ] || [ -z "$iv" ] || [ -z "$expected" ]; then
+    return 1
+  fi
+  local key
+  key=$(zc_dr_gen_key)
+  local plain
+  plain=$(zc_dr_decrypt "$data" "$key" "$iv")
+  local actual
+  actual=$(zc_dr_hash "$plain")
+  if [ "$actual" = "$expected" ]; then
+    return 0
+  fi
+  return 1
+}
+
+zc_dr_list() {
+  sqlite3 "$ZC_DR_DB" "SELECT id, category, ts FROM dr_index ORDER BY ts DESC;" 2>/dev/null
+}
+
+zc_dr_list_category() {
+  local category="$1"
+  sqlite3 "$ZC_DR_DB" "SELECT id, ts FROM dr_index WHERE category='$category' ORDER BY ts DESC;" 2>/dev/null
+}
+
+zc_dr_count() {
+  sqlite3 "$ZC_DR_DB" "SELECT COUNT(*) FROM zc_logs;" 2>/dev/null
+}
+
+zc_dr_count_category() {
+  local category="$1"
+  sqlite3 "$ZC_DR_DB" "SELECT COUNT(*) FROM dr_index WHERE category='$category';" 2>/dev/null
+}
+
+zc_dr_delete() {
+  local id="$1"
+  echo "DELETE FROM zc_logs WHERE id='$id';" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+  echo "DELETE FROM dr_index WHERE id='$id';" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+  zc_dr_log "deleted: $id"
+}
+
+zc_dr_cleanup_old() {
+  local cutoff
+  cutoff=$(date -d "$ZC_DR_RETENTION days ago" +"%Y-%m-%d %H:%M:%S" 2>/dev/null)
+  if [ -z "$cutoff" ]; then
+    return 0
+  fi
+  echo "DELETE FROM zc_logs WHERE ts < '$cutoff';" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+  echo "DELETE FROM dr_index WHERE ts < '$cutoff';" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+  zc_dr_log "old logs cleaned"
+}
+
+zc_dr_cleanup_excess() {
+  local count
+  count=$(zc_dr_count)
+  if [ -z "$count" ]; then
+    return 0
+  fi
+  if [ "$count" -gt "$ZC_DR_MAX" ]; then
+    local excess
+    excess=$((count - ZC_DR_MAX))
+    local ids
+    ids=$(sqlite3 "$ZC_DR_DB" "SELECT id FROM zc_logs ORDER BY ts ASC LIMIT $excess;" 2>/dev/null)
+    local id
+    for id in $ids; do
+      zc_dr_delete "$id"
+    done
+    zc_dr_log "excess cleaned: $excess"
+  fi
+}
+
+zc_dr_rotate_key() {
+  local old
+  old=$(zc_dr_gen_key)
+  local new
+  if [ -r /dev/urandom ]; then
+    new=$(head -c "$ZC_DR_KEY_LEN" /dev/urandom | od -An -tx1 | tr -d ' \n')
+  else
+    new=$(date +%s%N | sha256sum | awk '{print $1}')
+  fi
+  echo "$new" > "$ZC_DR_KEY" 2>/dev/null
+  chmod 600 "$ZC_DR_KEY" 2>/dev/null
+  zc_dr_state_set "previous_key" "$old"
+  zc_dr_log "key rotated"
+  echo "$new"
+}
+
+zc_dr_export() {
+  local out="$1"
+  if [ -z "$out" ]; then
+    out="$ZC_ROOT/dr_export.txt"
+  fi
+  sqlite3 "$ZC_DR_DB" "SELECT id, data, iv, hash, ts FROM zc_logs ORDER BY ts;" 2>/dev/null > "$out"
+  zc_dr_log "exported: $out"
+}
+
+zc_dr_import() {
+  local in="$1"
+  if [ ! -f "$in" ]; then
+    return 1
+  fi
+  local line
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+    local id
+    local data
+    local iv
+    local hash
+    local ts
+    id=$(echo "$line" | cut -d'|' -f1)
+    data=$(echo "$line" | cut -d'|' -f2)
+    iv=$(echo "$line" | cut -d'|' -f3)
+    hash=$(echo "$line" | cut -d'|' -f4)
+    ts=$(echo "$line" | cut -d'|' -f5)
+    if [ -n "$id" ] && [ -n "$data" ]; then
+      echo "INSERT OR REPLACE INTO zc_logs (id, data, iv, hash, ts) VALUES ('$id', '$data', '$iv', '$hash', '$ts');" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+    fi
+  done < "$in"
+  zc_dr_log "imported: $in"
+}
+
+zc_dr_wipe() {
+  echo "DELETE FROM zc_logs;" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+  echo "DELETE FROM dr_index;" | sqlite3 "$ZC_DR_DB" 2>/dev/null
+  rm -f "$ZC_DR_KEY" 2>/dev/null
+  zc_dr_log "wiped"
+}
+
+zc_dr_self_test() {
+  local test="zc_dr_selftest"
+  local id
+  id=$(zc_dr_write "selftest" "$test")
+  if [ -z "$id" ]; then
+    zc_dr_log "self test write failed"
+    return 1
+  fi
+  local out
+  out=$(zc_dr_read "$id")
+  if [ "$out" != "$test" ]; then
+    zc_dr_log "self test read mismatch"
+    return 1
+  fi
+  if ! zc_dr_verify "$id"; then
+    zc_dr_log "self test verify failed"
+    return 1
+  fi
+  zc_dr_delete "$id"
+  zc_dr_log "self test passed"
+  return 0
+}
+
+zc_dr_status() {
+  echo "ZC dr version: $ZC_VERSION"
+  echo "cipher: $ZC_DR_CIPHER"
+  echo "hash: $ZC_DR_HASH"
+  echo "retention: $ZC_DR_RETENTION days"
+  echo "max: $ZC_DR_MAX"
+  echo "logs: $(zc_dr_count)"
+  echo "dr db: $ZC_DR_DB"
+  echo "dr log: $ZC_DR_LOG"
+}
+
+zc_dr_main() {
+  zc_dr_log "DR000001.DBF start"
+  zc_dr_init_dirs
+  zc_dr_gen_key
+  zc_dr_init_db
+  zc_dr_state_set "version" "$ZC_VERSION"
+  zc_dr_self_test
+  zc_dr_cleanup_old
+  zc_dr_cleanup_excess
+  zc_dr_status
+  zc_dr_log "DR000001.DBF done"
+}
+
+case "$1" in
+  start)
+    zc_dr_main
+    ;;
+  write)
+    zc_dr_write "$2" "$3"
+    ;;
+  read)
+    zc_dr_read "$2"
+    ;;
+  verify)
+    zc_dr_verify "$2"
+    ;;
+  list)
+    zc_dr_list
+    ;;
+  list-cat)
+    zc_dr_list_category "$2"
+    ;;
+  count)
+    zc_dr_count
+    ;;
+  delete)
+    zc_dr_delete "$2"
+    ;;
+  clean)
+    zc_dr_cleanup_old
+    zc_dr_cleanup_excess
+    ;;
+  rotate)
+    zc_dr_rotate_key
+    ;;
+  export)
+    zc_dr_export "$2"
+    ;;
+  import)
+    zc_dr_import "$2"
+    ;;
+  wipe)
+    zc_dr_wipe
+    ;;
+  selftest)
+    zc_dr_self_test
+    ;;
+  status)
+    zc_dr_status
+    ;;
+  *)
+    zc_dr_main
+    ;;
+esac
+
+exit 0
