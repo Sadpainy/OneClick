@@ -1,0 +1,90 @@
+License.OneClick
+
+Copyright (c) 2026 Sadpainy  OneClick Project
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public
+License along with this program.  If not, see
+<https://www.gnu.org/licenses/>.
+
+Additional Terms under Section 7 of the GNU Affero General Public
+License, Version 3
+
+Pursuant to Section 7 of the GNU Affero General Public License,
+Version 3 (AGPL-3.0), the following additional terms apply to this
+Program and to any material added to a covered work as authorized
+by the copyright holder.
+
+1. Attribution Preservation and Origin Marking
+
+Any conveying of this Program, or of any modified version based on
+this Program, must preserve the following in a conspicuous place:
+
+(a) the copyright notice of the original author;
+(b) a statement that the work is licensed under AGPL-3.0 and any
+    additional terms stated in this document;
+(c) a reasonable notice indicating where a copy of the License may
+    be found.
+
+Modified versions must be marked in a reasonable manner as different
+from the original version. The marking must not be removed or
+obscured by subsequent conveyors.
+
+This additional term is made under Section 7(b) of AGPL-3.0.
+
+2. Prohibition of Origin Misrepresentation
+
+You may not misrepresent the origin of this Program or of any
+material added to a covered work.
+
+In particular, you may not:
+
+(a) state or imply that the original author endorses, sponsors, or
+    is affiliated with any modified version, derivative work, or
+    distribution, without express prior written permission;
+(b) remove, alter, or obscure any notice of origin, authorship, or
+    provenance contained in the Program;
+(c) represent a modified version as the original Program or as an
+    official release of the original author.
+
+This additional term is made under Section 7(c) of AGPL-3.0.
+
+3. Limitation on Use of Author Names for Publicity
+
+You may not use the name, trade name, trademark, or service mark of
+the original author or of any contributor to this Program for
+publicity purposes, commercial advertising, or to imply endorsement
+of any product, service, or modified version, without express prior
+written permission.
+
+Nothing in this term limits your rights under trademark law to use
+names in a descriptive, nominative, or other legally protected
+manner.
+
+This additional term is made under Section 7(d) and Section 7(e)
+of AGPL-3.0.
+
+4. Indemnification for Contractual Assumptions
+
+If you convey this Program or a modified version of it under terms
+that include a contractual assumption of liability to the recipient,
+you must indemnify, defend, and hold harmless the original author
+and all contributors of this Program from any liability that such
+contractual assumption directly imposes on them.
+
+This obligation applies only to the extent that the liability arises
+from your contractual assumption and not from the acts or omissions
+of the original author or contributors.
+
+This additional term is made under Section 7(f) of AGPL-3.0.
+
+End of Additional Terms
